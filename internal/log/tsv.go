@@ -1,0 +1,89 @@
+package log
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+
+	"parallelizer/internal/job"
+)
+
+// TSV writes the 9-column job log used by GNU parallel.
+type TSV struct {
+	mu       sync.Mutex
+	w        *bufio.Writer
+	f        *os.File
+	toStdout bool
+}
+
+// New opens the job log. The path is a plain filename (overwritten) or, with
+// the GNU syntax, "+filename" to append to an existing log without repeating
+// the header. "-" writes the log to stdout.
+func New(path string) (*TSV, error) {
+	if path == "" {
+		return nil, nil
+	}
+	if path == "-" {
+		return &TSV{w: bufio.NewWriter(os.Stdout), toStdout: true}, nil
+	}
+
+	name := path
+	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	if strings.HasPrefix(path, "+") {
+		name = path[1:]
+		flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	}
+	f, err := os.OpenFile(name, flags, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create --joblog %s: %w", name, err)
+	}
+	t := &TSV{w: bufio.NewWriterSize(f, 64*1024), f: f}
+	if st, err := f.Stat(); err == nil && st.Size() > 0 {
+		// Appending to an existing log: GNU parallel does not repeat the
+		// header either.
+		return t, nil
+	}
+	t.Header()
+	return t, nil
+}
+
+func (t *TSV) Header() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	fmt.Fprintln(t.w, "Seq\tHost\tStarttime\tJobRuntime\tSend\tReceive\tExitval\tSignal\tCommand")
+	t.flushMaybe()
+}
+
+func (t *TSV) Write(r job.Result, command string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Exitval/Signal follow GNU parallel: a job killed by signal S is logged
+	// as Exitval = 128+S, Signal = S; a normally exited job as its exit status
+	// and Signal = 0.
+	fmt.Fprintf(t.w, "%d\t%s\t%.3f\t%.3f\t%d\t%d\t%d\t%d\t%s\n",
+		r.Seq, ":", float64(r.Start.UnixNano())/1e9, r.Runtime.Seconds(),
+		0, r.Received, r.Status(), r.Signal, command)
+	t.flushMaybe()
+}
+
+// flushMaybe keeps the stdout job log in step with job output instead of
+// dumping it all at the end.
+func (t *TSV) flushMaybe() {
+	if t.toStdout {
+		t.w.Flush()
+	}
+}
+
+func (t *TSV) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	err := t.w.Flush()
+	if t.f != nil {
+		if cerr := t.f.Close(); err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
