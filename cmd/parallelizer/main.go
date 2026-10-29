@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
 
 	"parallelizer/internal/cli"
@@ -39,6 +40,59 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "parallelizer: %v\n", err)
 		return 255
 	}
+	warnFdLimit(opts.JobCount)
+
+	// Register signals before opening the input: while the input is being
+	// opened (or spooled) the pool does not exist yet, so the handler parks
+	// the code in `pending` and it is applied as soon as the pool is ready.
+	// Spooling to a blocking stdin has its own immediate handler inside
+	// source.Spool, which removes the temp file and re-raises the signal.
+	var (
+		sigMu   sync.Mutex
+		poolPtr *pool.Pool
+		pending int // exit code of a signal that arrived before the pool
+		sigStop = make(chan struct{})
+	)
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGPIPE)
+	go func() {
+		for {
+			select {
+			case sig := <-sigCh:
+				code := 0
+				switch sig {
+				case syscall.SIGINT:
+					code = 130
+				case syscall.SIGTERM:
+					code = 143
+				case syscall.SIGPIPE:
+					// A closed stdout must exit 141 like GNU parallel instead
+					// of dying from the signal; Output reports the EPIPE.
+					code = 141
+				case syscall.SIGUSR1:
+					sigMu.Lock()
+					p := poolPtr
+					sigMu.Unlock()
+					if p != nil {
+						p.DumpRunning(os.Stderr)
+					}
+					continue
+				}
+				sigMu.Lock()
+				p := poolPtr
+				if p == nil {
+					pending = code
+					sigMu.Unlock()
+					continue
+				}
+				sigMu.Unlock()
+				p.Interrupt(code)
+			case <-sigStop:
+				return
+			}
+		}
+	}()
+	defer close(sigStop)
 
 	input, total, cleanup, err := openInput(opts)
 	if err != nil {
@@ -53,25 +107,14 @@ func run() int {
 			fmt.Fprintf(os.Stderr, "parallelizer: %v\n", err)
 			return 255
 		}
-
-		sigCh := make(chan os.Signal, 4)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGPIPE)
-		go func() {
-			for sig := range sigCh {
-				switch sig {
-				case syscall.SIGINT:
-					p.Interrupt(130)
-				case syscall.SIGTERM:
-					p.Interrupt(143)
-				case syscall.SIGPIPE:
-					// A closed stdout must exit 141 like GNU parallel instead
-					// of dying from the signal; Output reports the EPIPE.
-					p.Interrupt(141)
-				case syscall.SIGUSR1:
-					p.DumpRunning(os.Stderr)
-				}
-			}
-		}()
+		sigMu.Lock()
+		poolPtr = p
+		pend := pending
+		pending = 0
+		sigMu.Unlock()
+		if pend != 0 {
+			p.Interrupt(pend) // signal arrived just before the pool existed
+		}
 
 		code := p.Run(input)
 		if err := p.Close(); err != nil {
@@ -83,6 +126,27 @@ func run() int {
 		return code
 	}()
 	return code
+}
+
+// warnFdLimit complains when -j is likely to exceed the process file
+// descriptor soft limit: every running job holds two pipe ends of its own.
+// It only warns — the estimate is approximate and the actual failure (if any)
+// is reported per job.
+func warnFdLimit(jobs int) {
+	var rl syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
+		return
+	}
+	const infinity = ^uint64(0)
+	if rl.Cur == 0 || rl.Cur == infinity {
+		return
+	}
+	need := uint64(2)*uint64(jobs) + 64
+	if need > rl.Cur {
+		fmt.Fprintf(os.Stderr,
+			"parallelizer: warning: -j%d needs roughly %d file descriptors but the soft limit is %d; jobs may fail (raise it with: ulimit -n %d)\n",
+			jobs, need, rl.Cur, need)
+	}
 }
 
 // probeTmpDir verifies --tmpdir is writable before any job runs. Failing fast

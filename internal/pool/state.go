@@ -21,7 +21,6 @@ type State struct {
 	cmds    map[int]string // seq -> command
 	killed  map[int]bool   // seq -> killed by --halt
 
-	started   int
 	failed    int
 	succeeded int
 	finished  int
@@ -61,7 +60,6 @@ func (s *State) StartJob(seq int, cmd string) bool {
 	if s.halting {
 		return false
 	}
-	s.started++
 	s.cmds[seq] = cmd
 	return true
 }

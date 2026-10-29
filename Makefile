@@ -2,7 +2,7 @@ BIN     := bin/parallelizer
 VERSION := 0.1.0
 LDFLAGS := -s -w -X parallelizer/internal/cli.Version=$(VERSION)
 
-.PHONY: all build test race diff install clean release linux
+.PHONY: all build test race bench diff install clean release linux
 
 all: build
 
@@ -14,6 +14,10 @@ test:
 
 race:
 	go test -race ./...
+
+# Micro-benchmarks for the output hot paths (LineStream, grouped Emit).
+bench:
+	go test -run xxx -bench . -benchtime 1s ./internal/pool/
 
 # Compares exit status and output against GNU parallel. GNU_PARALLEL defaults
 # to `parallel` found in PATH; override it to point at a source checkout:

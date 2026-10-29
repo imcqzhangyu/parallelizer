@@ -48,12 +48,6 @@ type Options struct {
 	ShowHelp    bool
 }
 
-// ErrVersion and ErrHelp let main distinguish "print and exit 0" from errors.
-var (
-	ErrVersion = errors.New("version requested")
-	ErrHelp    = errors.New("help requested")
-)
-
 // Parse turns argv into Options. It accepts:
 //
 //	-j4 -j 4 --jobs 4 --jobs=4

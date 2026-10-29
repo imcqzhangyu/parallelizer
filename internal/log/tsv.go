@@ -27,7 +27,9 @@ func New(path string) (*TSV, error) {
 		return nil, nil
 	}
 	if path == "-" {
-		return &TSV{w: bufio.NewWriter(os.Stdout), toStdout: true}, nil
+		t := &TSV{w: bufio.NewWriter(os.Stdout), toStdout: true}
+		t.Header()
+		return t, nil
 	}
 
 	name := path

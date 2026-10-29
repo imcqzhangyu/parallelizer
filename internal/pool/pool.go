@@ -40,10 +40,25 @@ func New(opts *cli.Options, total int, stdout, stderr io.Writer) (*Pool, error) 
 		// --resume must add to the existing log instead of overwriting it.
 		joblogPath = "+" + opts.JobLog
 		// Percentage --halt rules count the jobs that still have to run.
-		total -= len(skip)
-		if total < 0 {
-			total = 0
+		// Subtract only resumed jobs that also occur in this input (seq <=
+		// total): the joblog may come from a longer, earlier run.
+		if opts.Halt.Pct > 0 && total > 0 {
+			overlap := 0
+			for seq := range skip {
+				if seq <= total {
+					overlap++
+				}
+			}
+			total -= overlap
+			if total < 0 {
+				total = 0
+			}
 		}
+	}
+	if opts.DryRun {
+		// GNU parallel does not open the joblog at all in a dry-run: no file,
+		// no header, nothing on stdout for --joblog -.
+		joblogPath = ""
 	}
 
 	jl, err := log.New(joblogPath)

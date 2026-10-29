@@ -457,7 +457,9 @@ func TestSIGUSR1DumpsRunningJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := <-done; err == nil {
-		t.Error("expected a non-zero status after SIGTERM")
+		t.Fatal("expected a non-zero status after SIGTERM")
+	} else if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 143 {
+		t.Errorf("exit = %v, want 143", err)
 	}
 }
 
@@ -487,19 +489,127 @@ func TestBrokenPipeExits141(t *testing.T) {
 	}
 }
 
-// --joblog must not log dry-run jobs, matching GNU parallel.
+// --joblog must not be touched at all by a dry-run, matching GNU parallel
+// (which does not even open the file).
 func TestJoblogSkipsDryRun(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "joblog")
 	r := run(t, "echo hi\n", "-j1", "--dry-run", "--joblog", logPath)
 	if r.code != 0 {
 		t.Fatal(r.stderr)
 	}
-	data, err := os.ReadFile(logPath)
-	if err != nil {
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("joblog must not be created during a dry-run (stat err = %v)", err)
+	}
+}
+
+// signalExit runs a long-running job, sends sig, and asserts the documented
+// exit status plus prompt shutdown.
+func signalExit(t *testing.T, sig syscall.Signal, want int) {
+	t.Helper()
+	cmd := exec.Command(binPath, "-j2")
+	cmd.Stdin = strings.NewReader("sleep 30\nsleep 30\n")
+	cmd.Stdout = io.Discard
+	var errb syncBuf
+	cmd.Stderr = &errb
+	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(data)) != "Seq\tHost\tStarttime\tJobRuntime\tSend\tReceive\tExitval\tSignal\tCommand" {
-		t.Fatalf("dry-run must only write the header, got:\n%s", data)
+	time.Sleep(300 * time.Millisecond) // let both jobs start
+	start := time.Now()
+	if err := cmd.Process.Signal(sig); err != nil {
+		t.Fatal(err)
+	}
+	err := cmd.Wait()
+	dur := time.Since(start)
+
+	ee, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("wait: %v (stderr=%s)", err, errb.String())
+	}
+	if ee.ExitCode() != want {
+		t.Fatalf("exit = %d, want %d (stderr=%s)", ee.ExitCode(), want, errb.String())
+	}
+	if dur > 5*time.Second {
+		t.Fatalf("jobs were not killed promptly, took %v", dur)
+	}
+}
+
+// SIGINT must exit 130 and kill the running jobs.
+func TestInterruptExits130(t *testing.T) { signalExit(t, syscall.SIGINT, 130) }
+
+// SIGTERM must exit 143 and kill the running jobs.
+func TestTerminateExits143(t *testing.T) { signalExit(t, syscall.SIGTERM, 143) }
+
+// -a FILE reads commands from the file, stdin ignored.
+func TestArgFileHappyPath(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "cmds")
+	if err := os.WriteFile(file, []byte("echo from-a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := run(t, "echo from-stdin\n", "-j1", "-a", file)
+	if r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+	if r.stdout != "from-a\n" {
+		t.Fatalf("stdout = %q, want only the file's command output", r.stdout)
+	}
+}
+
+// --shell selects the interpreter, and PARALLELIZER_SHELL is the env fallback.
+func TestCustomShell(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "fakesh")
+	body := "#!/bin/sh\necho \"SHELL[$#]:$2\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := run(t, "echo hi\n", "-j1", "--shell", script)
+	if r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+	if r.stdout != "SHELL[2]:echo hi\n" {
+		t.Fatalf("--shell ignored: stdout = %q", r.stdout)
+	}
+
+	r2 := runEnv(t, append(os.Environ(), "PARALLELIZER_SHELL="+script), "echo hi\n", "-j1")
+	if r2.stdout != "SHELL[2]:echo hi\n" {
+		t.Fatalf("PARALLELIZER_SHELL ignored: stdout = %q", r2.stdout)
+	}
+}
+
+// --keep-cr keeps the CR of CRLF input (so the shell sees it; here echo
+// prints it back).
+func TestKeepCR(t *testing.T) {
+	r := run(t, "echo A\r\n", "-j1", "--keep-cr")
+	if r.code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", r.code, r.stderr)
+	}
+	if r.stdout != "A\r\n" {
+		t.Fatalf("stdout = %q, want the CR kept", r.stdout)
+	}
+}
+
+// --joblog - writes the log to stdout; the header comes first.
+func TestJoblogToStdout(t *testing.T) {
+	r := run(t, "echo hi\n", "-j1", "--joblog", "-")
+	if r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+	lines := strings.Split(strings.TrimRight(r.stdout, "\n"), "\n")
+	if !strings.HasPrefix(lines[0], "Seq\tHost\t") {
+		t.Fatalf("first stdout line = %q, want the joblog header", lines[0])
+	}
+	found := false
+	for _, l := range lines {
+		if strings.HasPrefix(l, "1\t:\t") && strings.HasSuffix(l, "\techo hi") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("stdout = %q, want a joblog row for seq 1", r.stdout)
+	}
+	if !strings.Contains(r.stdout, "hi\n") {
+		t.Fatalf("stdout = %q, want the job's output too", r.stdout)
 	}
 }
 
@@ -545,7 +655,13 @@ func TestResumeSkipsCompletedJobs(t *testing.T) {
 	if len(lines) != 4 {
 		t.Fatalf("joblog lines = %d, want header + 3 rows:\n%s", len(lines), data)
 	}
-	if !strings.Contains(lines[1], "echo one") || !strings.Contains(lines[3], "echo three") {
+	if !strings.Contains(lines[1], "echo one") {
+		t.Fatalf("seeded row missing:\n%s", data)
+	}
+	// Rows are written in completion order (as GNU parallel does), so the two
+	// new rows may appear in either order.
+	joined := strings.Join(lines[2:], "\n")
+	if !strings.Contains(joined, "echo two") || !strings.Contains(joined, "echo three") {
 		t.Fatalf("joblog rows wrong:\n%s", data)
 	}
 }
