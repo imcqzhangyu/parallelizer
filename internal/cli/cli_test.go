@@ -3,6 +3,7 @@ package cli
 import (
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestParseHalt(t *testing.T) {
@@ -164,6 +165,41 @@ func TestNormalize(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("normalize = %v, want %v", got, want)
+		}
+	}
+}
+
+// GNU parallel accepts a bare number of seconds for --timeout; the flag parser
+// must accept it too (both the separate and = forms), while leaving unit
+// forms and non-numeric values alone.
+func TestTimeoutBareSeconds(t *testing.T) {
+	tests := []struct {
+		argv []string
+		want time.Duration
+		err  bool
+	}{
+		{[]string{"--timeout", "30"}, 30 * time.Second, false},
+		{[]string{"--timeout=5"}, 5 * time.Second, false},
+		{[]string{"--timeout", "200ms"}, 200 * time.Millisecond, false},
+		{[]string{"--timeout", "1s"}, time.Second, false},
+		{[]string{"--timeout", "0"}, 0, false},
+		{[]string{"--timeout", "-5"}, 0, true},
+		{[]string{"--timeout", "abc"}, 0, true},
+	}
+	for _, tc := range tests {
+		opts, err := Parse(tc.argv)
+		if tc.err {
+			if err == nil {
+				t.Errorf("Parse(%v): expected error", tc.argv)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("Parse(%v): %v", tc.argv, err)
+			continue
+		}
+		if opts.Timeout != tc.want {
+			t.Errorf("Parse(%v).Timeout = %v, want %v", tc.argv, opts.Timeout, tc.want)
 		}
 	}
 }

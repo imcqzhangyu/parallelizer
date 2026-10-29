@@ -202,7 +202,21 @@ func Parse(argv []string) (*Options, error) {
 // normalize rewrites the compact forms GNU parallel users type.
 func normalize(argv []string) []string {
 	out := make([]string, 0, len(argv))
-	for _, a := range argv {
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+
+		// GNU parallel accepts a bare number of seconds for --timeout
+		// (--timeout 30); time.ParseDuration requires a unit, so add it here.
+		if a == "--timeout" && i+1 < len(argv) && isDigits(argv[i+1]) {
+			out = append(out, a, argv[i+1]+"s")
+			i++
+			continue
+		}
+		if v, ok := strings.CutPrefix(a, "--timeout="); ok && isDigits(v) {
+			out = append(out, "--timeout="+v+"s")
+			continue
+		}
+
 		switch {
 		case a == "" || a == "-":
 			out = append(out, a)
@@ -228,6 +242,19 @@ func normalize(argv []string) []string {
 		}
 	}
 	return out
+}
+
+// isDigits reports whether s is a non-empty string of ASCII digits.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func allRunes(s, set string) bool {
@@ -299,7 +326,8 @@ Flags:
                         "+FILE" appends instead of overwriting)
       --resume          skip jobs already listed in --joblog (requires it)
   -r, --retries N       re-run each failed job up to N more times (same host)
-      --timeout DUR     kill a job after DUR (e.g. 30s, 5m)
+      --timeout DUR     kill a job after DUR (e.g. 30s, 5m; a bare number
+                        is seconds, like GNU parallel)
       --termseq SEQ     kill escalation, default TERM,200,TERM,100,TERM,50,KILL,25
       --tmpdir DIR      directory for output spooling (default: $TMPDIR or /tmp)
       --mem-limit BYTES in-memory output per stream before spilling to disk

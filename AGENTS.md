@@ -17,6 +17,8 @@ gofmt -l .                 # must print nothing; CI fails otherwise
 
 - Single test: `go test -run TestName ./test/` (e2e package; it builds the
   binary itself in TestMain — no pre-build needed).
+- Remote-platform check: `PLZ=./parallelizer-linux-amd64 ./test/remote_smoke.sh`
+  (23 assertions, bash-only, runs on the CentOS box — see SERVER.local.md).
 - Fuzz seeds only: `go test -run 'Fuzz' ./internal/cli/`.
   Real fuzzing: `go test -fuzz FuzzParseHalt -fuzztime 20s ./internal/cli/`.
   **Never delete `internal/cli/testdata/fuzz/`** — entries there are fuzz-found
@@ -33,8 +35,10 @@ gofmt -l .                 # must print nothing; CI fails otherwise
 
 ## Commit checklist
 
-`gofmt -l .` → `go vet ./...` → `go test -race ./...` → `make diff` (24/24
-must pass) → `make linux` if syscall code changed (cross-compile check).
+`gofmt -l .` → `go vet ./...` → `go test -race ./...` → `make diff` (all
+scenarios must pass; old GNU versions print `skip` for capability-gated
+scenarios like `--halt ...done` and the signal-job exit convention) →
+`make linux` if syscall code changed (cross-compile check).
 
 ## Architecture (the wiring, not the file tree)
 

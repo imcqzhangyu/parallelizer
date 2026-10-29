@@ -23,8 +23,10 @@ make install        # /usr/local/bin/parallelizer
 make linux          # static linux/amd64 binary
 ```
 
-The binary is pure Go (`CGO_ENABLED=0`), so it runs on CentOS 7.6 and any other
-Linux with a 3.x kernel.
+The binary is pure Go (`CGO_ENABLED=0`), so it runs on CentOS and any other
+Linux with a 3.x kernel — verified on **CentOS 7.9 (glibc 2.17, kernel 3.10)**
+against GNU parallel 20160222 (22/22 comparable scenarios; 2 skipped because
+that GNU lacks `--halt ...done` and misreports signal-killed jobs).
 
 ## Usage
 
@@ -41,7 +43,7 @@ parallelizer [flags] -a FILE      commands from FILE
 | `--joblog FILE` | 9-column TSV log, GNU compatible (`-` = stdout, `+FILE` = append) |
 | `--resume` | skip jobs already listed in `--joblog` (requires a file, not `-`) |
 | `-r, --retries N` | re-run each failed job up to N more times (same host) |
-| `--timeout DUR` | kill a job after DUR (`30s`, `5m`, `200ms`) |
+| `--timeout DUR` | kill a job after DUR (`30s`, `5m`, `200ms`, or bare seconds like `30`) |
 | `--termseq SEQ` | kill escalation (default `TERM,200,TERM,100,TERM,50,KILL,25`) |
 | `--tmpdir DIR` | where large outputs are spooled |
 | `--mem-limit BYTES` | in-memory output per stream before spilling (default 8 MiB) |
@@ -154,15 +156,20 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 | `--resume` | skips jobs listed in `--joblog` | same (output of skipped jobs is not replayed) |
 | `--retries N` | only with `--sshlogin` (other hosts) | retried on the same host |
 | `--halt` percentage | needs total job count, reads all input | same; input is spooled to a temp file first |
+| `--halt ...done=N` | needs a newer GNU (missing in 20160222) | always supported |
+| `--halt ...fail=1` exit for a signal-killed job | 20160222 exits 0 (despite reporting the failure); newer GNU exits 128+S | 128+S (matches newer GNU) |
+| joblog `Exitval` for signal death | 20160222 logs 0 (`Signal` carries S); newer GNU logs 128+S | 128+S (matches newer GNU) |
 | Percentage `--halt` exit | number of failed jobs | same |
 
 ## Performance
 
 On 10 000 trivial jobs (`true`, `-j8`) parallelizer takes ~8.7s where GNU
-parallel takes ~23.9s (~2.8x). Output handling is pipelined with scheduling:
-feeding 256 MB of job output through a ~12.8 MB/s consumer finishes in 25.2s,
-i.e. at the consumer's own floor (25.0s), so a slow reader never stalls new job
-starts. `make bench` runs the micro-benchmarks for the output hot paths.
+parallel takes ~23.9s (~2.8x) on an 8-core macOS machine; on the 4-core
+CentOS 7 test box it is 3.2s vs 18.1s (5.7x, GNU 20160222). Output handling is
+pipelined with scheduling: feeding 256 MB of job output through a ~12.8 MB/s
+consumer finishes in 25.2s, i.e. at the consumer's own floor (25.0s), so a
+slow reader never stalls new job starts. `make bench` runs the
+micro-benchmarks for the output hot paths.
 
 ## Development
 
@@ -173,10 +180,21 @@ make diff    # differential test against GNU parallel
 ```
 
 `make diff` compares exit status and sorted output (and stderr for one case)
-against GNU parallel for 24 scenarios. Point it at a specific GNU binary with:
+against GNU parallel for 24 scenarios. Scenarios whose semantics are missing or
+wrong in old GNU builds are **capability-gated** (probe GNU, print `skip`), so
+the same script passes on GNU 20160222 (22 ok, 2 skipped) and modern GNU
+(24 ok). Point it at a specific GNU binary with:
 
 ```bash
 GNU_PARALLEL="perl /path/to/gnu-parallel/src/parallel" make diff
+```
+
+`test/remote_smoke.sh` asserts what the differential test cannot (signal exit
+codes 130/143, SIGPIPE 141, spool cleanup, joblog signal columns, flag
+rejections); it needs only bash and the binary:
+
+```bash
+PLZ=./parallelizer-linux-amd64 ./test/remote_smoke.sh   # 23 assertions
 ```
 
 GitHub Actions runs `gofmt`, `go vet`, `go test -race`, the fuzz seed corpus

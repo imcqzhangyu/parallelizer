@@ -109,9 +109,22 @@ check "halt fail=2"     $'exit 1\nexit 2\nexit 0\n' -j1 --halt now,fail=2
 check "halt soon"       $'sleep 0.2; echo late\nexit 1\n' -j2 --halt soon,fail=1
 check "no halt, 2 fails" $'exit 1\nexit 2\nexit 0\n' -j1
 check "success rule"    $'true\ntrue\n' -j1 --halt now,success=1
-check "done rule"       $'true\n' -j1 --halt soon,done=1
-check "signal job"      $'kill -9 $$\n' -j1 --halt now,fail=1
-check "timeout"         $'sleep 5\n' -j1 --timeout 1s
+# GNU parallel before ~2017 has no "done" in --halt; run the scenario only
+# when this GNU supports it (CentOS ships 20160222).
+if printf 'true\n' | $GNU -j1 --halt soon,done=1 >/dev/null 2>&1; then
+    check "done rule"       $'true\n' -j1 --halt soon,done=1
+else
+    printf 'skip %-32s (this GNU lacks --halt ...done)\n' "done rule"
+fi
+# Old GNU (20160222) reports "job failed" for a signal-killed job under
+# --halt now,fail=1 but still exits 0; newer GNU and parallelizer exit 128+S.
+# Probe first, compare only against GNU that follows the modern convention.
+if [ "$(printf 'kill -9 $$\n' | $GNU -j1 --halt now,fail=1 >/dev/null 2>&1; echo $?)" = "0" ]; then
+    printf 'skip %-32s (old GNU exits 0 for signal-killed jobs)\n' "signal job"
+else
+    check "signal job"      $'kill -9 $$\n' -j1 --halt now,fail=1
+fi
+check "timeout"         $'sleep 5\n' -j1 --timeout 1
 check "grouped output"  $'echo A1; sleep 0.15; echo A2\necho B1\n' -j2
 check "tag"             $'echo hi\n' -j1 --tag
 check "keep-order"      $'sleep 0.15; echo first\nsleep 0.02; echo second\n' -j2 -k
