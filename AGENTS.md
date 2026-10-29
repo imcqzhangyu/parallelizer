@@ -27,6 +27,9 @@ gofmt -l .                 # must print nothing; CI fails otherwise
   `PARALLEL="--will-cite"` avoids GNU's citation text polluting stderr.
 - Version bump: edit `VERSION` in the Makefile only (single source; injected
   into `cli.Version`, which is a `var`, not a `const`).
+- Legacy-platform test target (CentOS 7.6 host, credentials + smoke-test
+  steps): see `SERVER.local.md` — a **gitignored local file**; never copy its
+  contents into a tracked file.
 
 ## Commit checklist
 
