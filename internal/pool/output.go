@@ -97,18 +97,18 @@ func (o *Output) writeLocked(tag string, a, b *sink.Sink) {
 		prefix := []byte(tag + "\t")
 		if a != nil {
 			tw := &tagWriter{w: o.out, prefix: prefix, bol: true}
-			o.handleErr(a.CopyTo(tw))
+			o.handleErr(a.CopyTo(tw), true)
 		}
 		if b != nil {
 			tw := &tagWriter{w: o.errw, prefix: prefix, bol: true}
-			o.handleErr(b.CopyTo(tw))
+			o.handleErr(b.CopyTo(tw), false)
 		}
 	} else {
 		if a != nil {
-			o.handleErr(a.CopyTo(o.out))
+			o.handleErr(a.CopyTo(o.out), true)
 		}
 		if b != nil {
-			o.handleErr(b.CopyTo(o.errw))
+			o.handleErr(b.CopyTo(o.errw), false)
 		}
 	}
 	if a != nil {
@@ -119,16 +119,23 @@ func (o *Output) writeLocked(tag string, a, b *sink.Sink) {
 	}
 }
 
-// handleErr reacts to a write failure on our own output. A broken pipe stops
-// the run like `head` on a GNU parallel pipeline; anything else (disk full,
-// ...) is reported once instead of being silently dropped, because the user
-// would otherwise see a successful exit status for truncated output.
-func (o *Output) handleErr(err error) {
+// handleErr reacts to a write failure on our own output. isStdout selects
+// which stream failed.
+//
+// A broken stdout stops the run like `head` on a GNU parallel pipeline (exit
+// 141). A broken stderr (e.g. the user closed it with 2>&-) must not kill the
+// run: GNU parallel keeps going and only loses the diagnostic stream, so we do
+// the same. Anything else (disk full, ...) is reported once instead of being
+// silently dropped, because the user would otherwise see a successful exit
+// status for truncated output.
+func (o *Output) handleErr(err error, isStdout bool) {
 	if err == nil {
 		return
 	}
-	if errors.Is(err, syscall.EPIPE) && o.onEPIPE != nil {
-		o.onEPIPE()
+	if errors.Is(err, syscall.EPIPE) {
+		if isStdout && o.onEPIPE != nil {
+			o.onEPIPE()
+		}
 		return
 	}
 	o.errOnce.Do(func() {
@@ -180,32 +187,38 @@ func (l *LineStream) Flush() { l.drain(true) }
 func (o *Output) writeLine(w io.Writer, tag string, line []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	isStdout := w == o.out
 	if o.tag && tag != "" {
 		if _, err := io.WriteString(w, tag+"\t"); err != nil {
-			o.handleErr(err)
+			o.handleErr(err, isStdout)
 		}
 	}
 	if _, err := w.Write(line); err != nil {
-		o.handleErr(err)
+		o.handleErr(err, isStdout)
 	}
 }
 
 // Tagged prefixes every write with tag + TAB and serialises jobs' writes so
 // prefixes stay line-atomic. It is what makes --tag work with --ungroup.
 type Tagged struct {
-	o  *Output
-	tw *tagWriter
+	o        *Output
+	tw       *tagWriter
+	isStdout bool
 }
 
 func (o *Output) NewTagged(tag string, w io.Writer) *Tagged {
-	return &Tagged{o: o, tw: &tagWriter{w: w, prefix: []byte(tag + "\t"), bol: true}}
+	return &Tagged{
+		o:        o,
+		tw:       &tagWriter{w: w, prefix: []byte(tag + "\t"), bol: true},
+		isStdout: w == o.out,
+	}
 }
 
 func (t *Tagged) Write(p []byte) (int, error) {
 	t.o.mu.Lock()
 	defer t.o.mu.Unlock()
 	n, err := t.tw.Write(p)
-	t.o.handleErr(err)
+	t.o.handleErr(err, t.isStdout)
 	return n, err
 }
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -74,6 +75,50 @@ func (t *TSV) flushMaybe() {
 	if t.toStdout {
 		t.w.Flush()
 	}
+}
+
+// CompletedSeqs returns the job sequence numbers already present in the job
+// log, for --resume. A missing file yields an empty set (nothing to resume).
+// The path may use the GNU "+" append prefix, which is ignored when reading.
+func CompletedSeqs(path string) (map[int]bool, error) {
+	done := make(map[int]bool)
+	if path == "" || path == "-" {
+		return done, nil
+	}
+	name := strings.TrimPrefix(path, "+")
+	f, err := os.Open(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return done, nil
+		}
+		return nil, fmt.Errorf("cannot read --joblog %s: %w", name, err)
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	first := true
+	for sc.Scan() {
+		line := sc.Text()
+		if first {
+			first = false
+			if strings.HasPrefix(line, "Seq\t") {
+				continue // header
+			}
+		}
+		if line == "" {
+			continue
+		}
+		seq, err := strconv.Atoi(strings.SplitN(line, "\t", 2)[0])
+		if err != nil {
+			// Be liberal: ignore corrupt lines, resume the rest.
+			continue
+		}
+		done[seq] = true
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("cannot read --joblog %s: %w", name, err)
+	}
+	return done, nil
 }
 
 func (t *TSV) Close() error {

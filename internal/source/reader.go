@@ -2,6 +2,8 @@ package source
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -12,6 +14,7 @@ type Reader struct {
 	br     *bufio.Reader
 	keepCR bool
 	eof    bool
+	err    error
 }
 
 func New(r io.Reader, keepCR bool) *Reader {
@@ -25,6 +28,12 @@ func (r *Reader) Next() (string, bool) {
 		line, err := r.br.ReadString('\n')
 		if err != nil {
 			r.eof = true
+			// Hitting the end of the input is normal; anything else means the
+			// command list was read only partially and must fail the run
+			// instead of silently dropping the remaining commands.
+			if err != io.EOF && !errors.Is(err, io.ErrUnexpectedEOF) {
+				r.err = err
+			}
 		}
 		line = strings.TrimSuffix(line, "\n")
 		if !r.keepCR {
@@ -37,6 +46,9 @@ func (r *Reader) Next() (string, bool) {
 	}
 	return "", false
 }
+
+// Err reports a non-EOF read error seen while streaming the command list.
+func (r *Reader) Err() error { return r.err }
 
 // Spool copies all command lines into a temporary file and returns the number
 // of jobs. It is used when a percentage --halt rule needs the total count.
@@ -64,6 +76,11 @@ func Spool(r io.Reader, keepCR bool, tmpdir string) (*os.File, int, error) {
 			os.Remove(f.Name())
 			return nil, 0, err
 		}
+	}
+	if err := rd.Err(); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return nil, 0, fmt.Errorf("cannot read input: %w", err)
 	}
 	if err := w.Flush(); err != nil {
 		f.Close()

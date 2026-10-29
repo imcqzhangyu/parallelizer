@@ -39,6 +39,8 @@ parallelizer [flags] -a FILE      commands from FILE
 | `--halt RULE` | stop early, see below |
 | `-a, --arg-file FILE` | read commands from FILE (`-` = stdin) |
 | `--joblog FILE` | 9-column TSV log, GNU compatible (`-` = stdout, `+FILE` = append) |
+| `--resume` | skip jobs already listed in `--joblog` (requires a file, not `-`) |
+| `-r, --retries N` | re-run each failed job up to N more times (same host) |
 | `--timeout DUR` | kill a job after DUR (`30s`, `5m`, `200ms`) |
 | `--termseq SEQ` | kill escalation (default `TERM,200,TERM,100,TERM,50,KILL,25`) |
 | `--tmpdir DIR` | where large outputs are spooled |
@@ -100,6 +102,19 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 - `--joblog +FILE` appends to an existing log without repeating the header (the
   GNU syntax). A plain `--joblog FILE` overwrites, as GNU does. A job killed by
   signal `S` is logged as `Exitval = 128+S`, `Signal = S`.
+- `--resume` reads the joblog and skips those sequence numbers; their output is
+  not replayed (same as GNU), but `-k` still prints later jobs' output and
+  percentage `--halt` rules only count the jobs that remain. It requires
+  `--joblog FILE` (not `-`).
+- `--retries N` re-runs a failed job up to N extra times **on the same host**
+  and keeps the last attempt. GNU parallel's `--retries` only fails over to
+  other ssh logins, of which this tool has none.
+- Closing stdout stops the run with `141` (SIGPIPE, like GNU). Closing stderr
+  does **not**: the run continues and only diagnostics are lost, matching GNU.
+- A command list that cannot be read to the end (I/O error mid-stream) fails
+  the run with `255` instead of silently dropping the remaining commands.
+- `--tmpdir` is probed at startup: a bad path fails immediately with `255`
+  rather than failing every job that produces large output.
 - `SIGUSR1` prints the jobs that are currently running.
 - A job's command line may be arbitrarily long, but it is held in memory: very
   long lines cost RAM proportional to their length.
@@ -121,7 +136,9 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 | Interrupt exit | `255` | `130` / `143` / `141` (SIGINT/SIGTERM/SIGPIPE) |
 | Killed job output | discarded | discarded (opt-in with `--keep-killed-output`) |
 | `-k` + killed job | later output is lost behind the hole | later output is still printed |
-| `--joblog` append | `--joblog +FILE` | same (`+FILE`); no `--resume` yet |
+| `--joblog` append | `--joblog +FILE` | same (`+FILE`) |
+| `--resume` | skips jobs listed in `--joblog` | same (output of skipped jobs is not replayed) |
+| `--retries N` | only with `--sshlogin` (other hosts) | retried on the same host |
 | `--halt` percentage | needs total job count, reads all input | same; input is spooled to a temp file first |
 | Percentage `--halt` exit | number of failed jobs | same |
 
@@ -134,11 +151,14 @@ make diff    # differential test against GNU parallel
 ```
 
 `make diff` compares exit status and sorted output (and stderr for one case)
-against GNU parallel for 23 scenarios. Point it at a specific GNU binary with:
+against GNU parallel for 24 scenarios. Point it at a specific GNU binary with:
 
 ```bash
 GNU_PARALLEL="perl /path/to/gnu-parallel/src/parallel" make diff
 ```
+
+GitHub Actions runs `gofmt`, `go vet`, `go test -race`, the fuzz seed corpus
+and the GNU differential test on every push (`.github/workflows/ci.yml`).
 
 Three behaviours differ from GNU parallel on purpose and are covered by the go
 tests instead: `--tag` is kept with `-u` (GNU drops it), `--keep-killed-output`

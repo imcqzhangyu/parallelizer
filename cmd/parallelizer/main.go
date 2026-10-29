@@ -35,6 +35,11 @@ func run() int {
 		return 0
 	}
 
+	if err := probeTmpDir(opts.TmpDir); err != nil {
+		fmt.Fprintf(os.Stderr, "parallelizer: %v\n", err)
+		return 255
+	}
+
 	input, total, cleanup, err := openInput(opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "parallelizer: %v\n", err)
@@ -78,6 +83,21 @@ func run() int {
 		return code
 	}()
 	return code
+}
+
+// probeTmpDir verifies --tmpdir is writable before any job runs. Failing fast
+// beats failing every large-output job partway through a long run.
+func probeTmpDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	f, err := os.CreateTemp(dir, "prlz-probe-*")
+	if err != nil {
+		return fmt.Errorf("--tmpdir %s is not usable: %w", dir, err)
+	}
+	name := f.Name()
+	f.Close()
+	return os.Remove(name)
 }
 
 // openInput resolves -a/stdin and pre-counts jobs when a percentage halt rule

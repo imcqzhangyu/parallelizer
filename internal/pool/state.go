@@ -47,6 +47,13 @@ func NewState(rule cli.HaltRule, steps []job.SignalStep, total int) *State {
 // Halted is closed the moment the scheduler stops accepting new jobs.
 func (s *State) Halted() <-chan struct{} { return s.halted }
 
+// IsHalted reports whether halting has begun (non-blocking).
+func (s *State) IsHalted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.halting
+}
+
 // StartJob reserves a slot. It returns false once halting has begun.
 func (s *State) StartJob(seq int, cmd string) bool {
 	s.mu.Lock()

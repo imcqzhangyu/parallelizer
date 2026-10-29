@@ -67,6 +67,34 @@ check_stderr() {
     fi
 }
 
+# check_resume NAME INPUT [ARGS...]: seeds an identical joblog (seq 1 already
+# done) for each tool, then compares output and exit status under --resume.
+check_resume() {
+    local name=$1 input=$2
+    shift 2
+    local dir g_out p_out g_code p_code
+    dir=$(mktemp -d)
+    local header='Seq\tHost\tStarttime\tJobRuntime\tSend\tReceive\tExitval\tSignal\tCommand\n'
+    printf "${header}1\t:\t1.0\t0.1\t0\t0\t0\t0\techo one\n" > "$dir/g.log"
+    printf "${header}1\t:\t1.0\t0.1\t0\t0\t0\t0\techo one\n" > "$dir/p.log"
+
+    g_out=$(printf '%s' "$input" | $GNU "$@" --joblog "$dir/g.log" 2>/dev/null)
+    g_code=$?
+    p_out=$(printf '%s' "$input" | "$PLZ" "$@" --joblog "$dir/p.log" 2>/dev/null)
+    p_code=$?
+    rm -rf "$dir"
+
+    if [ "$g_code" = "$p_code" ] \
+       && [ "$(printf '%s\n' "$g_out" | sort)" = "$(printf '%s\n' "$p_out" | sort)" ]; then
+        pass=$((pass + 1))
+        printf 'ok   %-32s exit=%s\n' "$name" "$p_code"
+    else
+        fail=$((fail + 1))
+        printf 'FAIL %-32s gnu(exit=%s) plz(exit=%s)\n' "$name" "$g_code" "$p_code"
+        diff <(printf '%s\n' "$g_out" | sort) <(printf '%s\n' "$p_out" | sort) | sed 's/^/     /'
+    fi
+}
+
 echo "GNU: $GNU"
 echo "PLZ: $PLZ"
 echo
@@ -94,6 +122,7 @@ check_stderr "stderr passthru" $'echo oops >&2\necho ok\n' -j1
 check "halted job output dropped" $'echo kept; sleep 3\nexit 1\n' -j2 --halt now,fail=1
 check "many jobs"       "$(for i in $(seq 1 200); do echo "echo $i"; done)" -j8
 check "halt many"       "$(for i in $(seq 1 50); do echo "true"; done)"$'\nexit 9\n' -j8 --halt now,fail=1
+check_resume "resume skips done" $'echo one\necho two\necho three\n' -j2 -k --resume
 
 # Deliberate differences from GNU parallel, covered by go tests instead:
 #   -u --tag        GNU drops the tag; parallelizer keeps it (TestTagWithUngroup)

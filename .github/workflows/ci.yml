@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: unit + end-to-end tests (race detector)
+        run: go test -race ./...
+
+      - name: fuzz seed corpus
+        run: go test -run 'Fuzz' ./internal/cli/
+
+      - name: install GNU parallel
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y parallel
+
+      - name: differential test against GNU parallel
+        # PARALLEL=--will-cite silences GNU parallel's citation reminder so it
+        # does not leak into the stderr comparison.
+        run: |
+          make build
+          PARALLEL="--will-cite" GNU_PARALLEL="parallel" ./test/diff_gnu.sh

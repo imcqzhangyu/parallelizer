@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"parallelizer/internal/job"
 	"parallelizer/internal/sink"
 )
 
@@ -27,7 +28,7 @@ type Options struct {
 	ArgFile    string
 	JobLog     string
 	Timeout    time.Duration
-	TermSeq    []SignalStep
+	TermSeq    []job.SignalStep
 	TmpDir     string
 	Shell      string
 	MemLimit   int64
@@ -40,15 +41,11 @@ type Options struct {
 	Quiet      bool
 	KeepCR     bool
 	KeepKilled bool
+	Resume     bool
+	Retries    int
 
 	ShowVersion bool
 	ShowHelp    bool
-}
-
-// SignalStep is one entry of --termseq.
-type SignalStep struct {
-	Name string
-	Wait time.Duration
 }
 
 // ErrVersion and ErrHelp let main distinguish "print and exit 0" from errors.
@@ -83,6 +80,8 @@ func Parse(argv []string) (*Options, error) {
 		quiet      bool
 		keepCR     bool
 		keepKilled bool
+		resume     bool
+		retries    int
 		verbose    int
 		showVer    bool
 		showHelp   bool
@@ -98,6 +97,9 @@ func Parse(argv []string) (*Options, error) {
 	fs.StringVar(&argFile, "a", "", "")
 	fs.StringVar(&argFile, "arg-file", "", "")
 	fs.StringVar(&jobLog, "joblog", "", "")
+	fs.IntVar(&retries, "r", 0, "")
+	fs.IntVar(&retries, "retries", 0, "")
+	fs.BoolVar(&resume, "resume", false, "")
 	fs.DurationVar(&timeout, "timeout", 0, "")
 	fs.StringVar(&termSeqRaw, "termseq", "", "")
 	fs.StringVar(&tmpDir, "tmpdir", "", "")
@@ -173,8 +175,13 @@ func Parse(argv []string) (*Options, error) {
 		Quiet:      quiet,
 		KeepCR:     keepCR,
 		KeepKilled: keepKilled,
+		Resume:     resume,
+		Retries:    retries,
 	}
-	if opts.MemLimit <= 0 {
+	if opts.MemLimit < 0 {
+		return nil, fmt.Errorf("--mem-limit must not be negative")
+	}
+	if opts.MemLimit == 0 {
 		opts.MemLimit = sink.DefaultLimit
 	}
 	if opts.Timeout < 0 {
@@ -188,6 +195,12 @@ func Parse(argv []string) (*Options, error) {
 	}
 	if opts.KeepOrder && opts.LineBuffer {
 		return nil, fmt.Errorf("--keep-order and --line-buffer are mutually exclusive")
+	}
+	if opts.Retries < 0 {
+		return nil, fmt.Errorf("--retries must not be negative")
+	}
+	if opts.Resume && (opts.JobLog == "" || opts.JobLog == "-") {
+		return nil, fmt.Errorf("--resume requires --joblog FILE")
 	}
 	return opts, nil
 }
@@ -207,6 +220,8 @@ func normalize(argv []string) []string {
 				out = append(out, "-j="+a[2:])
 			case a[1] == 'a':
 				out = append(out, "-a="+a[2:])
+			case a[1] == 'r':
+				out = append(out, "-r="+a[2:])
 			case allRunes(a[1:], "uvkq"):
 				for _, r := range a[1:] {
 					out = append(out, "-"+string(r))
@@ -288,6 +303,8 @@ Flags:
   -a, --arg-file FILE   read commands from FILE instead of stdin
       --joblog FILE     write a GNU-compatible 9-column TSV log ("-" = stdout,
                         "+FILE" appends instead of overwriting)
+      --resume          skip jobs already listed in --joblog (requires it)
+  -r, --retries N       re-run each failed job up to N more times (same host)
       --timeout DUR     kill a job after DUR (e.g. 30s, 5m)
       --termseq SEQ     kill escalation, default TERM,200,TERM,100,TERM,50,KILL,25
       --tmpdir DIR      directory for output spooling (default: $TMPDIR or /tmp)

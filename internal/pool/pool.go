@@ -20,21 +20,33 @@ type Pool struct {
 	out    *Output
 	log    *log.TSV
 	exec   *job.Exec
+	skip   map[int]bool // --resume: jobs already in the joblog
 	stdout io.Writer
 	stderr io.Writer
 }
 
 func New(opts *cli.Options, total int, stdout, stderr io.Writer) (*Pool, error) {
-	steps := make([]job.SignalStep, 0, len(opts.TermSeq))
-	for _, s := range opts.TermSeq {
-		sig, err := job.SignalByName(s.Name)
+	// cli has already validated the signal names; its steps are job steps.
+	steps := opts.TermSeq
+
+	skip := map[int]bool{}
+	joblogPath := opts.JobLog
+	if opts.Resume {
+		var err error
+		skip, err = log.CompletedSeqs(opts.JobLog)
 		if err != nil {
 			return nil, err
 		}
-		steps = append(steps, job.SignalStep{Signal: sig, Wait: s.Wait})
+		// --resume must add to the existing log instead of overwriting it.
+		joblogPath = "+" + opts.JobLog
+		// Percentage --halt rules count the jobs that still have to run.
+		total -= len(skip)
+		if total < 0 {
+			total = 0
+		}
 	}
 
-	jl, err := log.New(opts.JobLog)
+	jl, err := log.New(joblogPath)
 	if err != nil {
 		return nil, err
 	}
@@ -44,6 +56,7 @@ func New(opts *cli.Options, total int, stdout, stderr io.Writer) (*Pool, error) 
 		st:     NewState(opts.Halt, steps, total),
 		out:    NewOutput(stdout, stderr, opts.Tag, opts.KeepOrder),
 		log:    jl,
+		skip:   skip,
 		stdout: stdout,
 		stderr: stderr,
 	}
@@ -72,13 +85,14 @@ func (p *Pool) Run(src io.Reader) int {
 	var wg sync.WaitGroup
 
 	rd := source.New(src, p.opts.KeepCR)
+	var srcErr error
 	go func() {
 		defer close(jobs)
 		seq := 0
 		for {
 			line, ok := rd.Next()
 			if !ok {
-				return
+				break
 			}
 			seq++
 			select {
@@ -87,6 +101,9 @@ func (p *Pool) Run(src io.Reader) int {
 				return
 			}
 		}
+		// A partial read means some commands never ran: the run must fail
+		// rather than report success for a truncated command list.
+		srcErr = rd.Err()
 	}()
 
 	for i := 0; i < p.opts.JobCount; i++ {
@@ -100,10 +117,25 @@ func (p *Pool) Run(src io.Reader) int {
 	}
 
 	wg.Wait()
+
+	if srcErr != nil {
+		// An input read error outranks the job tally: the command list was
+		// truncated, so the run is not trustworthy. 255 = parallelizer itself
+		// failed.
+		fmt.Fprintf(p.stderr, "parallelizer: cannot read input: %v\n", srcErr)
+		return 255
+	}
 	return p.st.ExitCode()
 }
 
 func (p *Pool) runOne(spec job.Spec) {
+	if p.skip[spec.Seq] {
+		// --resume: this job already ran in an earlier invocation. Its output
+		// is not replayed (matching GNU parallel), but the --keep-order cursor
+		// still moves over the gap.
+		p.out.Skip(spec.Seq)
+		return
+	}
 	if !p.st.StartJob(spec.Seq, spec.Command) {
 		// Halting has begun: this job never runs. Tell the output layer so
 		// that --keep-order does not wait forever for this sequence number.
@@ -137,7 +169,20 @@ func (p *Pool) runOne(spec job.Spec) {
 	oc := &counter{w: outW}
 	ec := &counter{w: errW}
 
+	// --retries N: re-run a failed job up to N more times, on the same host
+	// (GNU parallel's --retries only fails over to other ssh logins, and we
+	// have none). The final attempt decides the job's accounting; output of
+	// every attempt is kept.
 	res := p.exec.Run(spec, oc, ec)
+	for attempt := 1; attempt <= p.opts.Retries && res.Failed() && !res.DryRun; attempt++ {
+		if p.st.IsHalted() {
+			break // killed or superseded by a halt: do not restart it
+		}
+		if p.opts.Verbose > 0 {
+			fmt.Fprintf(p.stderr, "parallelizer: #%d retry %d/%d\n", spec.Seq, attempt, p.opts.Retries)
+		}
+		res = p.exec.Run(spec, oc, ec)
+	}
 	res.Received = oc.n + ec.n
 
 	// A sink that could not spool its data (bad --tmpdir, full disk) must fail

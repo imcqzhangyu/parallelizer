@@ -1,6 +1,9 @@
 package cli
 
-import "testing"
+import (
+	"syscall"
+	"testing"
+)
 
 func TestParseHalt(t *testing.T) {
 	tests := []struct {
@@ -170,7 +173,7 @@ func TestParseTermSeq(t *testing.T) {
 	if err != nil || len(steps) != 2 {
 		t.Fatalf("ParseTermSeq: %v %v", steps, err)
 	}
-	if steps[1].Name != "KILL" || steps[1].Wait.Milliseconds() != 25 {
+	if steps[1].Signal != syscall.SIGKILL || steps[1].Wait.Milliseconds() != 25 {
 		t.Errorf("unexpected step %+v", steps[1])
 	}
 	if _, err := ParseTermSeq("TERM"); err == nil {
@@ -178,5 +181,12 @@ func TestParseTermSeq(t *testing.T) {
 	}
 	if _, err := ParseTermSeq("BOGUS,10"); err == nil {
 		t.Error("unknown signal must fail")
+	}
+	// Regression: this value overflowed time.Duration to a negative wait.
+	if _, err := ParseTermSeq("ILL,9227000000000"); err == nil {
+		t.Error("a duration that overflows time.Duration must fail")
+	}
+	if _, err := ParseTermSeq("ILL,999999999999999999999"); err == nil {
+		t.Error("an unparseable duration must fail")
 	}
 }

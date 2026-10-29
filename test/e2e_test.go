@@ -1,6 +1,7 @@
 package test
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -337,17 +338,37 @@ func TestPercentHaltRemovesSpoolFile(t *testing.T) {
 	}
 }
 
-// An output stream that cannot be spooled (bad --tmpdir) must fail the job and
-// be reported, instead of buffering unbounded in memory and exiting 0.
-func TestSpillFailureFailsJob(t *testing.T) {
-	r := run(t, "head -c 100000 /dev/zero | tr '\\0' 'x'\n", "-j1",
-		"--mem-limit", "1000",
-		"--tmpdir", filepath.Join(t.TempDir(), "no-such-dir"))
-	if r.code != 1 {
-		t.Fatalf("exit = %d, want 1", r.code)
+// A bad --tmpdir is rejected up front, before any job runs.
+func TestBadTmpdirRejectedAtStartup(t *testing.T) {
+	r := run(t, "echo hi\n", "-j1", "--tmpdir", filepath.Join(t.TempDir(), "no-such-dir"))
+	if r.code != 255 {
+		t.Fatalf("exit = %d, want 255", r.code)
 	}
-	if !strings.Contains(r.stderr, "cannot spill output") {
-		t.Fatalf("stderr = %q, want the spill failure reported", r.stderr)
+	if !strings.Contains(r.stderr, "not usable") {
+		t.Fatalf("stderr = %q, want the --tmpdir problem reported", r.stderr)
+	}
+}
+
+func TestNegativeMemLimitRejected(t *testing.T) {
+	r := run(t, "echo hi\n", "-j1", "--mem-limit", "-1")
+	if r.code != 255 {
+		t.Fatalf("exit = %d, want 255", r.code)
+	}
+	if !strings.Contains(r.stderr, "mem-limit") {
+		t.Fatalf("stderr = %q", r.stderr)
+	}
+}
+
+// A read error partway through the command list must fail the run instead of
+// silently dropping the remaining commands and exiting 0. Reading a directory
+// opens fine on Unix but fails on every read (EISDIR).
+func TestInputReadErrorFailsRun(t *testing.T) {
+	r := run(t, "", "-j1", "-a", t.TempDir())
+	if r.code != 255 {
+		t.Fatalf("exit = %d, want 255", r.code)
+	}
+	if !strings.Contains(r.stderr, "cannot read input") {
+		t.Fatalf("stderr = %q, want the read error reported", r.stderr)
 	}
 }
 
@@ -490,5 +511,82 @@ func TestVerboseTwice(t *testing.T) {
 	}
 	if !strings.Contains(r.stderr, "exit=0") {
 		t.Fatalf("stderr = %q, want a completion line", r.stderr)
+	}
+}
+
+const joblogHeader = "Seq\tHost\tStarttime\tJobRuntime\tSend\tReceive\tExitval\tSignal\tCommand\n"
+
+// --resume must not re-run (or reprint) jobs already listed in the joblog,
+// must append without repeating the header, and must keep --keep-order moving
+// over the skipped sequence numbers.
+func TestResumeSkipsCompletedJobs(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "joblog")
+	seed := joblogHeader + "1\t:\t1.0\t0.1\t0\t0\t0\t0\techo one\n"
+	if err := os.WriteFile(logPath, []byte(seed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := run(t, "echo one\necho two\necho three\n", "-j2", "-k", "--joblog", logPath, "--resume")
+	if r.code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", r.code, r.stderr)
+	}
+	if r.stdout != "two\nthree\n" {
+		t.Fatalf("stdout = %q, want seq 1 skipped and the rest printed in order", r.stdout)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(data), "Seq\tHost"); n != 1 {
+		t.Fatalf("header written %d times, want 1", n)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("joblog lines = %d, want header + 3 rows:\n%s", len(lines), data)
+	}
+	if !strings.Contains(lines[1], "echo one") || !strings.Contains(lines[3], "echo three") {
+		t.Fatalf("joblog rows wrong:\n%s", data)
+	}
+}
+
+func TestResumeRequiresJoblog(t *testing.T) {
+	r := run(t, "echo hi\n", "--resume")
+	if r.code != 255 {
+		t.Fatalf("exit = %d, want 255", r.code)
+	}
+	if !strings.Contains(r.stderr, "--joblog") {
+		t.Fatalf("stderr = %q, want --resume's requirement spelled out", r.stderr)
+	}
+}
+
+// --retries N runs a failed job up to N extra times and keeps the last attempt.
+func TestRetriesEventuallySucceed(t *testing.T) {
+	flag := filepath.Join(t.TempDir(), "flag")
+	cmd := fmt.Sprintf("if [ -f %s ]; then echo second; exit 0; else touch %s; echo first; exit 1; fi",
+		flag, flag)
+	r := run(t, cmd+"\n", "-j1", "--retries", "2")
+	if r.code != 0 {
+		t.Fatalf("exit = %d, want 0 after a successful retry", r.code)
+	}
+	for _, want := range []string{"first", "second"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Fatalf("stdout = %q, missing %q", r.stdout, want)
+		}
+	}
+}
+
+func TestRetriesExhausted(t *testing.T) {
+	counter := filepath.Join(t.TempDir(), "attempts")
+	r := run(t, fmt.Sprintf("echo x >> %s; exit 1\n", counter), "-j1", "-r", "2")
+	if r.code != 1 {
+		t.Fatalf("exit = %d, want 1", r.code)
+	}
+	data, err := os.ReadFile(counter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(data), "x"); n != 3 {
+		t.Fatalf("attempts = %d, want 1 + 2 retries", n)
 	}
 }

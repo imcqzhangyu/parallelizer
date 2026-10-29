@@ -2,6 +2,8 @@ package pool
 
 import (
 	"bytes"
+	"io"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -197,3 +199,50 @@ func (brokenWriter) Write(p []byte) (int, error) { return 0, syscall.EPIPE }
 type diskFullWriter struct{}
 
 func (diskFullWriter) Write(p []byte) (int, error) { return 0, syscall.ENOSPC }
+
+func TestFirstSinkErr(t *testing.T) {
+	good := sinkWith(t, "ok")
+	if err := firstSinkErr(nil, good); err != nil {
+		t.Fatalf("healthy sink reported: %v", err)
+	}
+	if err := firstSinkErr(nil, nil); err != nil {
+		t.Fatalf("nil sinks reported: %v", err)
+	}
+
+	bad := sink.New(filepath.Join(t.TempDir(), "missing-dir"), 1)
+	if _, err := bad.Write([]byte(strings.Repeat("x", 100))); err == nil {
+		t.Fatal("expected the spill to fail")
+	}
+	if err := firstSinkErr(bad, good); err == nil {
+		t.Fatal("sink failure must surface to the caller")
+	}
+}
+
+// Guards the per-line locking cost of --line-buffer: output handling must stay
+// far cheaper than spawning the job processes themselves.
+func BenchmarkLineStream(b *testing.B) {
+	o := NewOutput(io.Discard, io.Discard, false, false)
+	ls := o.NewLineStream("cmd", io.Discard, 1<<20)
+	line := []byte(strings.Repeat("x", 79) + "\n")
+	b.SetBytes(int64(len(line)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := ls.Write(line); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The grouped path holds the output lock while copying a whole job's output.
+func BenchmarkEmitGrouped(b *testing.B) {
+	o := NewOutput(io.Discard, io.Discard, false, false)
+	tmpdir := b.TempDir()
+	payload := bytes.Repeat([]byte("payload line\n"), 100) // ~1.3 KB per job
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sk := sink.New(tmpdir, 1<<20)
+		sk.Write(payload)
+		o.Emit(i+1, "", sk, nil)
+	}
+}
