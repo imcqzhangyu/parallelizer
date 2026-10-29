@@ -171,8 +171,7 @@ func (r HaltRule) ExitCode(failed, total, lastExit, lastSignal int) int {
 		return 0
 	}
 	if r.pctPPM > 0 {
-		// Like GNU parallel: the exit status is the number of failed jobs.
-		return cap101(failed)
+		return r.FinalExitCode(failed, total)
 	}
 	if r.Count == 1 {
 		if lastSignal != 0 {
@@ -185,6 +184,19 @@ func (r HaltRule) ExitCode(failed, total, lastExit, lastSignal int) int {
 			return 1
 		}
 		return 0
+	}
+	return cap101(failed)
+}
+
+// FinalExitCode is the status of a run that ended without the halt rule
+// firing (or with no rule at all). GNU parallel reports the percentage of
+// failed jobs whenever a percentage rule is configured, even when it never
+// fires: --halt 100% with one of four jobs failing exits 25, not 1.
+func (r HaltRule) FinalExitCode(failed, total int) int {
+	if r.Set && r.pctPPM > 0 && total > 0 {
+		// "If Y% is used the exit status is the percentage of jobs that
+		// failed" — rounded up (1 of 4 = 25, 1 of 8 = 13, 3 of 8 = 38).
+		return cap101((failed*100 + total - 1) / total)
 	}
 	return cap101(failed)
 }

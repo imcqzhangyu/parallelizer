@@ -29,6 +29,11 @@ type State struct {
 	halted   chan struct{}
 	exitCode int
 	exitSet  bool
+
+	// killOnStart says a job that registers its pgid after halting began must
+	// be killed immediately. True for `--halt now,...` (running jobs die) and
+	// for a signal; false for `soon`, which lets started jobs finish.
+	killOnStart bool
 }
 
 func NewState(rule cli.HaltRule, steps []job.SignalStep, total int) *State {
@@ -65,16 +70,31 @@ func (s *State) StartJob(seq int, cmd string) bool {
 }
 
 // SetPgid registers the process group. If halting started in the meantime the
-// job is killed right away, closing the start/kill race.
+// job is either killed right away (now rules, signals) or allowed to finish
+// (soon rules), closing the start/kill race.
 func (s *State) SetPgid(seq, pgid int) {
 	s.mu.Lock()
 	if s.halting {
+		if !s.killOnStart {
+			// soon: the job was admitted before the halt, let it finish.
+			s.running[seq] = pgid
+			s.mu.Unlock()
+			return
+		}
 		s.killed[seq] = true
 		s.mu.Unlock()
 		go job.KillGroup(pgid, s.steps)
 		return
 	}
 	s.running[seq] = pgid
+	s.mu.Unlock()
+}
+
+// Reaped drops a pgid as soon as its process has been reaped, so a concurrent
+// halt cannot signal a process group the kernel may have recycled.
+func (s *State) Reaped(seq int) {
+	s.mu.Lock()
+	delete(s.running, seq)
 	s.mu.Unlock()
 }
 
@@ -135,6 +155,7 @@ func (s *State) JobDone(res *job.Result, quiet bool) string {
 		s.exitCode = s.rule.ExitCode(s.failed, s.total, res.ExitCode, res.Signal)
 		s.exitSet = true
 		if s.rule.When == cli.Now {
+			s.killOnStart = true
 			for seq, pgid := range s.running {
 				s.killed[seq] = true
 				toKill = append(toKill, pgid)
@@ -156,17 +177,17 @@ func (s *State) JobDone(res *job.Result, quiet bool) string {
 	return fmt.Sprintf("parallelizer: %s:\n%s\n", report, cmd)
 }
 
-// Interrupt stops everything, e.g. on SIGINT, and forces the exit status.
+// Interrupt stops everything, e.g. on SIGINT. A signal wins over a halt rule:
+// the user asked to stop now, so its exit status replaces the rule's.
 func (s *State) Interrupt(code int) {
 	s.mu.Lock()
 	if !s.halting {
 		s.halting = true
 		close(s.halted)
 	}
-	if !s.exitSet {
-		s.exitCode = code
-		s.exitSet = true
-	}
+	s.exitCode = code
+	s.exitSet = true
+	s.killOnStart = true
 	var toKill []int
 	for seq, pgid := range s.running {
 		s.killed[seq] = true
@@ -185,10 +206,7 @@ func (s *State) ExitCode() int {
 	if s.exitSet {
 		return s.exitCode
 	}
-	if s.failed > 101 {
-		return 101
-	}
-	return s.failed
+	return s.rule.FinalExitCode(s.failed, s.total)
 }
 
 // DumpRunning prints the jobs that are still alive (SIGUSR1).

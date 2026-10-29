@@ -123,14 +123,46 @@ func TestExitCode(t *testing.T) {
 		{"fail=1 signal", HaltRule{Set: true, When: Now, On: OnFail, Count: 1}, 1, 0, -1, 9, 137},
 		{"fail=2 count", HaltRule{Set: true, When: Now, On: OnFail, Count: 2}, 2, 0, 1, 0, 2},
 		{"success=1", HaltRule{Set: true, When: Now, On: OnSuccess, Count: 1}, 0, 0, 0, 0, 0},
-		// GNU parallel returns the number of failed jobs for percentage rules,
-		// not a percentage.
-		{"pct", HaltRule{Set: true, When: Now, On: OnFail, Pct: 0.03, pctPPM: 30000}, 2, 40, 2, 0, 2},
+		// GNU parallel: a percentage rule's exit status is the percentage of
+		// failed jobs, rounded up (see "EXIT STATUS" in parallel(1)).
+		{"pct 2 of 40", HaltRule{Set: true, When: Now, On: OnFail, Pct: 0.03, pctPPM: 30000}, 2, 40, 2, 0, 5},
+		{"pct 1 of 4", HaltRule{Set: true, When: Soon, On: OnFail, Pct: 0.05, pctPPM: 50000}, 1, 4, 1, 0, 25},
+		{"pct 3 of 8", HaltRule{Set: true, When: Soon, On: OnFail, Pct: 0.30, pctPPM: 300000}, 3, 8, 1, 0, 38},
+		{"pct all failed", HaltRule{Set: true, When: Soon, On: OnFail, Pct: 1, pctPPM: 1000000}, 4, 4, 1, 0, 100},
+		{"pct done rule counts failures", HaltRule{Set: true, When: Soon, On: OnDone, Pct: 0.5, pctPPM: 500000}, 1, 4, 0, 0, 25},
 		{"pct, no total", HaltRule{Set: true, When: Soon, On: OnFail, Pct: 0.03, pctPPM: 30000}, 3, 0, 2, 0, 3},
 	}
 	for _, tc := range tests {
 		if got := tc.rule.ExitCode(tc.failed, tc.total, tc.lastExit, tc.lastSig); got != tc.want {
 			t.Errorf("%s: ExitCode = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// FinalExitCode covers the runs where the rule never fired: a percentage rule
+// still reports the percentage of failed jobs (GNU: --halt 100% with one of
+// four failing exits 25).
+func TestFinalExitCode(t *testing.T) {
+	pct := HaltRule{Set: true, When: Soon, On: OnFail, Pct: 0.5, pctPPM: 500000}
+	cases := []struct {
+		name   string
+		rule   HaltRule
+		failed int
+		total  int
+		want   int
+	}{
+		{"pct 1 of 4", pct, 1, 4, 25},
+		{"pct 2 of 4", pct, 2, 4, 50},
+		{"pct 1 of 6", pct, 1, 6, 17},
+		{"pct all ok", pct, 0, 4, 0},
+		{"pct success rule still reports failures", HaltRule{Set: true, When: Soon, On: OnSuccess, Pct: 1, pctPPM: 1000000}, 2, 4, 50},
+		{"absolute rule counts failures", HaltRule{Set: true, When: Soon, On: OnFail, Count: 99}, 2, 3, 2},
+		{"no rule", HaltRule{}, 2, 3, 2},
+		{"pct without total", pct, 3, 0, 3},
+	}
+	for _, c := range cases {
+		if got := c.rule.FinalExitCode(c.failed, c.total); got != c.want {
+			t.Errorf("%s: FinalExitCode = %d, want %d", c.name, got, c.want)
 		}
 	}
 }
@@ -206,6 +238,56 @@ func TestTimeoutBareSeconds(t *testing.T) {
 
 // --pty implies streaming (-u) so interactive output is visible while the job
 // runs; explicit buffering modes (-k, --line-buffer) are respected instead.
+// --timeout accepts GNU's forms (bare/fractional seconds, d) plus Go's units.
+func TestTimeoutForms(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"30", 30 * time.Second},
+		{"0.2", 200 * time.Millisecond},
+		{"1.5m", 90 * time.Second},
+		{"2h", 2 * time.Hour},
+		{"1d", 24 * time.Hour},
+		{"100ms", 100 * time.Millisecond},
+		{"0", 0},
+	}
+	for _, c := range cases {
+		opts, err := Parse([]string{"--timeout", c.in})
+		if err != nil {
+			t.Errorf("--timeout %s: %v", c.in, err)
+			continue
+		}
+		if opts.Timeout != c.want {
+			t.Errorf("--timeout %s = %v, want %v", c.in, opts.Timeout, c.want)
+		}
+	}
+
+	for _, bad := range []string{"abc", "NaN", "Inf", "-1", "-1h", "1x"} {
+		if _, err := Parse([]string{"--timeout", bad}); err == nil {
+			t.Errorf("--timeout %q must be rejected", bad)
+		}
+	}
+}
+
+// -r is GNU's --no-run-if-empty: accepted (our reader never runs empty input)
+// and, crucially, not --retries.
+func TestRetriesIsNotShortR(t *testing.T) {
+	opts, err := Parse([]string{"-r"})
+	if err != nil {
+		t.Fatalf("-r rejected: %v", err)
+	}
+	if opts.Retries != 0 {
+		t.Fatalf("-r set --retries to %d; GNU's -r means --no-run-if-empty", opts.Retries)
+	}
+	if _, err := Parse([]string{"--retries", "3"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse([]string{"--no-run-if-empty"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPtyImpliesUngroup(t *testing.T) {
 	opts, err := Parse([]string{"--pty"})
 	if err != nil {

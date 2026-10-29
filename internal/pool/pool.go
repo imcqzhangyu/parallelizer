@@ -88,6 +88,7 @@ func New(opts *cli.Options, total int, stdout, stderr io.Writer) (*Pool, error) 
 		Verbose:  opts.Verbose,
 		VerboseW: stderr,
 		OnStart:  p.st.SetPgid,
+		OnReap:   p.st.Reaped,
 		Pty:      opts.Pty,
 		Tty:      tty,
 	}
@@ -108,9 +109,10 @@ func (p *Pool) Run(src io.Reader) int {
 	var wg sync.WaitGroup
 
 	rd := source.New(src, p.opts.KeepCR)
-	var srcErr error
+	// The reader reports its error through a buffered channel: on a halt it may
+	// be abandoned in a blocking read(2), and Run must not wait for it.
+	readerDone := make(chan error, 1)
 	go func() {
-		defer close(jobs)
 		seq := 0
 		for {
 			line, ok := rd.Next()
@@ -121,31 +123,62 @@ func (p *Pool) Run(src io.Reader) int {
 			select {
 			case jobs <- job.Spec{Seq: seq, Command: line}:
 			case <-p.st.Halted():
+				// Halting: nobody will consume the rest. Do not close(jobs):
+				// workers leave through Halted() as well, and a close here
+				// would race with nothing (the reader is the only sender).
 				return
 			}
 		}
 		// A partial read means some commands never ran: the run must fail
 		// rather than report success for a truncated command list.
-		srcErr = rd.Err()
+		readerDone <- rd.Err()
+		close(jobs)
 	}()
 
 	for i := 0; i < p.opts.JobCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for spec := range jobs {
-				p.runOne(spec)
+			for {
+				select {
+				case spec, ok := <-jobs:
+					if !ok {
+						return
+					}
+					p.runOne(spec)
+				case <-p.st.Halted():
+					// Stop pulling new work. Commands still queued are
+					// abandoned; Run flushes their keep-order holes at the end.
+					return
+				}
 			}
 		}()
 	}
 
 	wg.Wait()
 
-	if srcErr != nil {
+	if p.st.IsHalted() {
+		// The workers are gone and the reader may still be blocked in a read we
+		// cannot cancel (a live pipe/fifo). Surface a read error if we already
+		// have one, flush finished output stuck behind abandoned sequence
+		// numbers, and return without waiting for the reader.
+		select {
+		case err := <-readerDone:
+			if err != nil {
+				fmt.Fprintf(p.stderr, "parallelizer: cannot read input: %v\n", err)
+				return 255
+			}
+		default:
+		}
+		p.out.FlushPending()
+		return p.st.ExitCode()
+	}
+
+	if err := <-readerDone; err != nil {
 		// An input read error outranks the job tally: the command list was
 		// truncated, so the run is not trustworthy. 255 = parallelizer itself
 		// failed.
-		fmt.Fprintf(p.stderr, "parallelizer: cannot read input: %v\n", srcErr)
+		fmt.Fprintf(p.stderr, "parallelizer: cannot read input: %v\n", err)
 		return 255
 	}
 	return p.st.ExitCode()
@@ -231,20 +264,22 @@ func (p *Pool) runOne(spec job.Spec) {
 	case p.opts.Ungroup:
 		// Output went straight to the terminal.
 	case p.opts.LineBuffer:
-		lsOut.Flush()
-		lsErr.Flush()
+		if res.Killed && !p.opts.KeepKilled {
+			// Complete lines already streamed cannot be recalled, but the
+			// unflushed tail belongs to a killed job and is dropped.
+			lsOut.Discard()
+			lsErr.Discard()
+		} else {
+			lsOut.Flush()
+			lsErr.Flush()
+		}
 	default:
 		if res.Killed && !p.opts.KeepKilled {
 			outSink.Close()
 			errSink.Close()
 			p.out.Skip(spec.Seq)
 		} else {
-			tag := spec.Command
-			if res.DryRun {
-				// The output already is the command; tagging would duplicate it.
-				tag = ""
-			}
-			p.out.Emit(spec.Seq, tag, outSink, errSink)
+			p.out.Emit(spec.Seq, spec.Command, outSink, errSink)
 		}
 	}
 

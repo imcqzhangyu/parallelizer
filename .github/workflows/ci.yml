@@ -20,6 +20,11 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: cross-compile (darwin arm64)
+        # pty_darwin.go and the darwin ioctl path are never executed on CI's
+        # Linux runner, but they must at least keep compiling.
+        run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
+
       - name: unit + end-to-end tests (race detector)
         run: go test -race ./...
 

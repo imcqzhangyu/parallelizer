@@ -66,6 +66,7 @@ func Parse(argv []string) (*Options, error) {
 		tmpDir     string
 		shell      string
 		memLimit   int64
+		timeoutRaw string
 		timeout    time.Duration
 		ungroup    bool
 		lineBuffer bool
@@ -93,11 +94,16 @@ func Parse(argv []string) (*Options, error) {
 	fs.StringVar(&argFile, "a", "", "")
 	fs.StringVar(&argFile, "arg-file", "", "")
 	fs.StringVar(&jobLog, "joblog", "", "")
-	fs.IntVar(&retries, "r", 0, "")
 	fs.IntVar(&retries, "retries", 0, "")
+	// GNU's -r/--no-run-if-empty: our reader already never runs empty or
+	// whitespace-only lines, so the flag is accepted and has no effect. It
+	// must not mean --retries (GNU users type -r expecting this one).
+	var noRunIfEmpty bool
+	fs.BoolVar(&noRunIfEmpty, "r", false, "")
+	fs.BoolVar(&noRunIfEmpty, "no-run-if-empty", false, "")
 	fs.BoolVar(&resume, "resume", false, "")
 	fs.BoolVar(&pty, "pty", false, "")
-	fs.DurationVar(&timeout, "timeout", 0, "")
+	fs.StringVar(&timeoutRaw, "timeout", "", "")
 	fs.StringVar(&termSeqRaw, "termseq", "", "")
 	fs.StringVar(&tmpDir, "tmpdir", "", "")
 	fs.StringVar(&shell, "shell", "", "")
@@ -140,6 +146,12 @@ func Parse(argv []string) (*Options, error) {
 	jobs, err := resolveJobs(jobsRaw)
 	if err != nil {
 		return nil, err
+	}
+	if timeoutRaw != "" {
+		timeout, err = parseTimeout(timeoutRaw)
+		if err != nil {
+			return nil, err
+		}
 	}
 	rule, err := ParseHalt(haltRaw)
 	if err != nil {
@@ -209,23 +221,41 @@ func Parse(argv []string) (*Options, error) {
 	return opts, nil
 }
 
+// parseTimeout accepts the GNU parallel forms (bare seconds, optionally
+// fractional, and the d/h/m/s units) plus Go's own duration syntax:
+//
+//	30  0.5  30s  1.5m  2h  1d  200ms
+func parseTimeout(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return d, nil
+	}
+	num, unit := s, time.Second
+	if strings.HasSuffix(s, "d") {
+		// GNU parallel accepts days; time.ParseDuration does not.
+		num, unit = strings.TrimSuffix(s, "d"), 24*time.Hour
+	}
+	f, err := strconv.ParseFloat(num, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("invalid --timeout %q: want e.g. 30, 0.5, 30s, 5m, 1h, 1d", s)
+	}
+	if f < 0 {
+		return 0, fmt.Errorf("--timeout must not be negative")
+	}
+	if f > float64(math.MaxInt64)/float64(unit) {
+		return 0, fmt.Errorf("invalid --timeout %q: too large", s)
+	}
+	return time.Duration(f * float64(unit)), nil
+}
+
 // normalize rewrites the compact forms GNU parallel users type.
 func normalize(argv []string) []string {
 	out := make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
-
-		// GNU parallel accepts a bare number of seconds for --timeout
-		// (--timeout 30); time.ParseDuration requires a unit, so add it here.
-		if a == "--timeout" && i+1 < len(argv) && isDigits(argv[i+1]) {
-			out = append(out, a, argv[i+1]+"s")
-			i++
-			continue
-		}
-		if v, ok := strings.CutPrefix(a, "--timeout="); ok && isDigits(v) {
-			out = append(out, "--timeout="+v+"s")
-			continue
-		}
 
 		switch {
 		case a == "" || a == "-":
@@ -238,8 +268,6 @@ func normalize(argv []string) []string {
 				out = append(out, "-j="+a[2:])
 			case a[1] == 'a':
 				out = append(out, "-a="+a[2:])
-			case a[1] == 'r':
-				out = append(out, "-r="+a[2:])
 			case allRunes(a[1:], "uvkq"):
 				for _, r := range a[1:] {
 					out = append(out, "-"+string(r))
@@ -252,19 +280,6 @@ func normalize(argv []string) []string {
 		}
 	}
 	return out
-}
-
-// isDigits reports whether s is a non-empty string of ASCII digits.
-func isDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 func allRunes(s, set string) bool {
@@ -335,9 +350,10 @@ Flags:
       --joblog FILE     write a GNU-compatible 9-column TSV log ("-" = stdout,
                         "+FILE" appends instead of overwriting)
       --resume          skip jobs already listed in --joblog (requires it)
-  -r, --retries N       re-run each failed job up to N more times (same host)
-      --timeout DUR     kill a job after DUR (e.g. 30s, 5m; a bare number
-                        is seconds, like GNU parallel)
+      --retries N       re-run each failed job up to N more times (same host)
+  -r, --no-run-if-empty accepted for GNU compatibility (empty input never runs)
+      --timeout DUR     kill a job after DUR (30, 0.5, 30s, 5m, 1h, 1d;
+                        a bare number is seconds, like GNU parallel)
       --termseq SEQ     kill escalation, default TERM,200,TERM,100,TERM,50,KILL,25
       --tmpdir DIR      directory for output spooling (default: $TMPDIR or /tmp)
       --mem-limit BYTES in-memory output per stream before spilling to disk

@@ -65,7 +65,7 @@ func (t *TSV) Write(r job.Result, command string) {
 	// Exitval/Signal follow GNU parallel: a job killed by signal S is logged
 	// as Exitval = 128+S, Signal = S; a normally exited job as its exit status
 	// and Signal = 0.
-	fmt.Fprintf(t.w, "%d\t%s\t%.3f\t%.3f\t%d\t%d\t%d\t%d\t%s\n",
+	fmt.Fprintf(t.w, "%d\t%s\t%.3f\t%10.3f\t%d\t%d\t%d\t%d\t%s\n",
 		r.Seq, ":", float64(r.Start.UnixNano())/1e9, r.Runtime.Seconds(),
 		0, r.Received, r.Status(), r.Signal, command)
 	t.flushMaybe()

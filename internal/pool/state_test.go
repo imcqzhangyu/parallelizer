@@ -131,3 +131,102 @@ func TestHaltSoonDonePercentage(t *testing.T) {
 		t.Fatal("50%% of 4 jobs done: no further jobs may start")
 	}
 }
+
+// A job admitted before a `soon` halt but registering its pgid afterwards must
+// be allowed to finish: soon means "let running jobs complete".
+func TestSetPgidAfterSoonHaltRunsJob(t *testing.T) {
+	rule, err := cli.ParseHalt("soon,fail=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := NewState(rule, nil, 0)
+	st.StartJob(1, "exit 1")
+	st.SetPgid(1, 4242)
+	st.StartJob(2, "sleep 10") // admitted before the halt fires
+
+	st.JobDone(&job.Result{Seq: 1, ExitCode: 1}, false) // soon rule fires
+	st.SetPgid(2, 4343)                                 // registers afterwards
+
+	if st.WasKilled(2) {
+		t.Fatal("soon must not kill a job that was already admitted")
+	}
+	var dump strings.Builder
+	st.DumpRunning(&dump)
+	if !strings.Contains(dump.String(), "pgid 4343") {
+		t.Fatalf("job 2 is not tracked as running: %q", dump.String())
+	}
+	// It may finish normally: not counted as killed.
+	res := job.Result{Seq: 2, ExitCode: 0}
+	st.JobDone(&res, false)
+	if res.Killed {
+		t.Fatal("job admitted before the halt must finish unkilled")
+	}
+}
+
+// The same window under a `now` rule must kill the late-registering job.
+func TestSetPgidAfterNowHaltKillsJob(t *testing.T) {
+	rule, err := cli.ParseHalt("now,fail=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := NewState(rule, nil, 0)
+	st.StartJob(1, "exit 1")
+	st.StartJob(2, "sleep 10")
+
+	st.JobDone(&job.Result{Seq: 1, ExitCode: 1}, false) // now rule fires
+	st.SetPgid(2, 999999)                               // never a real pgid
+
+	if !st.WasKilled(2) {
+		t.Fatal("now must kill a job that registers its pgid after the halt")
+	}
+}
+
+// Reaping a job drops its pgid immediately, so a later halt cannot signal a
+// process group the kernel may have recycled.
+func TestReapedDropsRunningPgid(t *testing.T) {
+	st := NewState(cli.HaltRule{When: cli.Never}, nil, 0)
+	st.SetPgid(1, 4242)
+	st.Reaped(1)
+	var dump strings.Builder
+	st.DumpRunning(&dump)
+	if !strings.Contains(dump.String(), "0 job(s) running") {
+		t.Fatalf("reaped job is still tracked: %q", dump.String())
+	}
+}
+
+// A percentage rule that never fires still sets the exit status: GNU reports
+// the failure percentage, not the failure count.
+func TestPercentRuleNeverFiredExit(t *testing.T) {
+	rule, err := cli.ParseHalt("100%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := NewState(rule, nil, 4)
+	for seq := 1; seq <= 4; seq++ {
+		res := job.Result{Seq: seq, ExitCode: 0}
+		if seq == 1 {
+			res.ExitCode = 7
+		}
+		st.JobDone(&res, false)
+	}
+	if got := st.ExitCode(); got != 25 {
+		t.Fatalf("exit = %d, want 25 (one failed of four)", got)
+	}
+}
+
+// A signal during shutdown wins over the halt rule's exit status.
+func TestInterruptOverridesHaltExit(t *testing.T) {
+	rule, err := cli.ParseHalt("now,success=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := NewState(rule, nil, 0)
+	st.JobDone(&job.Result{Seq: 1, ExitCode: 0}, false)
+	if got := st.ExitCode(); got != 0 {
+		t.Fatalf("exit after success halt = %d, want 0", got)
+	}
+	st.Interrupt(130)
+	if got := st.ExitCode(); got != 130 {
+		t.Fatalf("Ctrl-C after a halt must exit 130, got %d", got)
+	}
+}

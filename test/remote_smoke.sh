@@ -30,8 +30,12 @@ echo
 
 # --- signals -------------------------------------------------------------
 signal_exit() { # SIG WANT
-    local sig=$1 want=$2 code
-    (printf 'sleep 30\nsleep 30\n') | "$PLZ" -j2 2>"$WORK/sig.err" &
+    local sig=$1 want=$2 code marker cmd
+    # A unique argv[0] makes the leftover check immune to unrelated `sleep`
+    # processes owned by other users or concurrent test runs.
+    marker="prlz-smoke-$sig-$$"
+    cmd="bash -c 'exec -a $marker sleep 30'"
+    (printf '%s\n%s\n' "$cmd" "$cmd") | "$PLZ" -j2 2>"$WORK/sig.err" &
     local pid=$!
     sleep 0.4
     kill -"$sig" "$pid"
@@ -39,7 +43,7 @@ signal_exit() { # SIG WANT
     code=$?
     check "signal $sig -> exit $want" "$want" "$code"
     sleep 0.5
-    check "signal $sig: no job leftovers" "0" "$(pgrep -f 'sleep 30' | wc -l | tr -d '[:space:]')"
+    check "signal $sig: no job leftovers" "0" "$(pgrep -f "$marker" | wc -l | tr -d '[:space:]')"
 }
 signal_exit INT 130
 signal_exit TERM 143
@@ -68,7 +72,9 @@ set +o pipefail
 # --- percentage halt spool cleanup ---------------------------------------
 mkdir -p "$WORK/tmp"
 code=$(printf 'echo a\nexit 2\n' | TMPDIR="$WORK/tmp" "$PLZ" -j1 --halt now,fail=50% >/dev/null 2>&1; echo $?)
-check "percent halt exit = failed count" "1" "$code"
+check "percent halt exit = percentage" "50" "$code"
+code=$(printf 'false\nfalse\nfalse\nfalse\n' | "$PLZ" -j4 --halt 5% >/dev/null 2>&1; echo $?)
+check "5% halt, 1 of 4 failed -> 25" "25" "$code"
 check "percent halt removes spool file" "0" "$(ls -A "$WORK/tmp" | wc -l | tr -d '[:space:]')"
 
 # --- joblog --------------------------------------------------------------
@@ -106,6 +112,8 @@ check "bad --tmpdir rejected at startup" "255" "$(printf 'true\n' | "$PLZ" --tmp
 check "--resume without --joblog rejected" "255" "$(printf 'true\n' | "$PLZ" --resume >/dev/null 2>&1; echo $?)"
 check "-a missing file rejected" "255" "$("$PLZ" -a "$WORK/missing" >/dev/null 2>&1; echo $?)"
 check "bare --timeout seconds accepted" "1" "$(printf 'sleep 5\n' | "$PLZ" -j1 --timeout 1 >/dev/null 2>&1; echo $?)"
+check "fractional --timeout accepted" "1" "$(printf 'sleep 5\n' | "$PLZ" -j1 --timeout 0.2 >/dev/null 2>&1; echo $?)"
+check "-r is accepted (GNU no-run-if-empty)" "0" "$(printf 'echo hi\n' | "$PLZ" -r >/dev/null 2>&1; echo $?)"
 
 # --- pty / terminal isolation -------------------------------------------
 # Default path: jobs have no controlling terminal and must fail fast.

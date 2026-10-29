@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -312,12 +313,14 @@ func TestTagWithUngroup(t *testing.T) {
 }
 
 // --dry-run output already is the command; --tag must not duplicate it.
-func TestDryRunTagDoesNotDuplicate(t *testing.T) {
+func TestDryRunTagDuplicatesLikeGNU(t *testing.T) {
+	// GNU parallel prints the command once as output and prefixes it with the
+	// same command as the tag: "echo hi<TAB>echo hi".
 	r := run(t, "echo hi\n", "-j1", "--dry-run", "--tag")
 	if r.code != 0 {
 		t.Fatal(r.stderr)
 	}
-	if r.stdout != "echo hi\n" {
+	if r.stdout != "echo hi\techo hi\n" {
 		t.Fatalf("stdout = %q", r.stdout)
 	}
 }
@@ -328,8 +331,8 @@ func TestPercentHaltRemovesSpoolFile(t *testing.T) {
 	dir := t.TempDir()
 	r := runEnv(t, append(os.Environ(), "TMPDIR="+dir),
 		"echo a\nexit 2\n", "-j1", "--halt", "now,fail=50%")
-	if r.code != 1 {
-		t.Fatalf("exit = %d, want 1 failed job", r.code)
+	if r.code != 50 { // percentage rule: 1 failed of 2 jobs = 50
+		t.Fatalf("exit = %d, want 50 (1 failed of 2 jobs)", r.code)
 	}
 	left, err := filepath.Glob(filepath.Join(dir, "*"))
 	if err != nil {
@@ -626,6 +629,146 @@ func TestVerboseTwice(t *testing.T) {
 	}
 }
 
+// --version and --help work without reading any input.
+func TestVersionAndHelp(t *testing.T) {
+	r := run(t, "", "--version")
+	if r.code != 0 || !strings.Contains(r.stdout, "parallelizer") {
+		t.Fatalf("--version: code=%d stdout=%q", r.code, r.stdout)
+	}
+	r = run(t, "", "--help")
+	if r.code != 0 || !strings.Contains(r.stdout, "Usage:") || !strings.Contains(r.stdout, "--retries") {
+		t.Fatalf("--help: code=%d stdout=%q", r.code, r.stdout[:min(len(r.stdout), 80)])
+	}
+}
+
+// -r is GNU's --no-run-if-empty, not --retries.
+func TestGNUNoRunIfEmptyFlag(t *testing.T) {
+	r := run(t, "echo hi\n", "-r")
+	if r.code != 0 || r.stdout != "hi\n" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", r.code, r.stdout, r.stderr)
+	}
+}
+
+// GNU's bare fractional seconds must be accepted (--timeout 0.2).
+func TestTimeoutFractionalSeconds(t *testing.T) {
+	start := time.Now()
+	r := run(t, "sleep 5\n", "-j1", "--timeout", "0.2")
+	if r.code != 1 {
+		t.Fatalf("exit = %d, want 1 failed job (stderr=%q)", r.code, r.stderr)
+	}
+	if dur := time.Since(start); dur > 3*time.Second {
+		t.Fatalf("timeout did not fire: took %v", dur)
+	}
+}
+
+// A percentage --halt rule exits with the percentage of failed jobs, as GNU
+// parallel does ("1 of 4" = 25), not with the raw failure count.
+func TestPercentHaltExitCodeIsPercentage(t *testing.T) {
+	r := run(t, "false\nfalse\nfalse\nfalse\n", "-j4", "--halt", "5%")
+	if r.code != 25 {
+		t.Fatalf("exit = %d, want 25 (one failed of four jobs)", r.code)
+	}
+}
+
+// The percentage exit status applies even when the rule never fires.
+func TestPercentHaltExitWhenRuleNeverFires(t *testing.T) {
+	r := run(t, "exit 1\ntrue\ntrue\ntrue\n", "-j1", "--halt", "100%")
+	if r.code != 25 {
+		t.Fatalf("exit = %d, want 25 (one failed of four jobs, rule never fired)", r.code)
+	}
+}
+
+// A job that leaves a daemon holding stdout must not hold the run hostage:
+// GNU parallel returns when the job exits, and cmd.WaitDelay makes us do the
+// same instead of waiting for the orphan to close the inherited pipe.
+func TestDaemonGrandchildDoesNotBlock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binPath, "-j1")
+	cmd.Stdin = strings.NewReader("(trap \"\" HUP; sleep 5 &); echo done\n")
+	var out, errb strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	start := time.Now()
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		t.Fatalf("run blocked on the daemon's inherited stdout; output=%q", out.String())
+	}
+	if err != nil {
+		t.Fatalf("exit: %v (stderr=%q)", err, errb.String())
+	}
+	if dur := time.Since(start); dur > 4*time.Second {
+		t.Fatalf("run took %v; the orphaned pipe was not bounded", dur)
+	}
+	if !strings.Contains(out.String(), "done") {
+		t.Fatalf("output = %q, want the job's own output", out.String())
+	}
+}
+
+// SIGINT while the input is being spooled (percentage --halt reads the whole
+// input first) must remove the partial spool file and keep the 130 convention
+// (the process re-raises the signal with default disposition).
+func TestSpoolInterruptCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command(binPath, "-j1", "--halt", "5%")
+	cmd.Env = append(os.Environ(), "TMPDIR="+dir)
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stdin = pr
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pr.Close() // the child holds its own end
+	if _, err := pw.Write([]byte("echo a\n")); err != nil {
+		t.Fatal(err)
+	}
+	defer pw.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	time.Sleep(300 * time.Millisecond) // let it block reading the open pipe
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+
+	var werr error
+	select {
+	case werr = <-done:
+	case <-time.After(time.Second):
+		// The signal may have arrived before the spool watcher was installed;
+		// a second one is handled by it.
+		if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case werr = <-done:
+		case <-time.After(5 * time.Second):
+			cmd.Process.Kill()
+			t.Fatal("spooling was not interrupted")
+		}
+	}
+
+	ee, ok := werr.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("wait: %v", werr)
+	}
+	ws, _ := ee.Sys().(syscall.WaitStatus)
+	if code := ee.ExitCode(); code != 130 && !(ws.Signaled() && ws.Signal() == syscall.SIGINT) {
+		t.Fatalf("exit = %d (%v), want 130 or death by SIGINT", code, ws)
+	}
+	left, err := filepath.Glob(filepath.Join(dir, "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("spool file leaked: %v", left)
+	}
+}
+
 // findPython returns an interactive Python interpreter or skips the test.
 func findPython(t *testing.T) string {
 	t.Helper()
@@ -797,7 +940,7 @@ func TestRetriesEventuallySucceed(t *testing.T) {
 
 func TestRetriesExhausted(t *testing.T) {
 	counter := filepath.Join(t.TempDir(), "attempts")
-	r := run(t, fmt.Sprintf("echo x >> %s; exit 1\n", counter), "-j1", "-r", "2")
+	r := run(t, fmt.Sprintf("echo x >> %s; exit 1\n", counter), "-j1", "--retries", "2")
 	if r.code != 1 {
 		t.Fatalf("exit = %d, want 1", r.code)
 	}

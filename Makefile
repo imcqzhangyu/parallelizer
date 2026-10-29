@@ -2,12 +2,19 @@ BIN     := bin/parallelizer
 VERSION := 0.1.0
 LDFLAGS := -s -w -X parallelizer/internal/cli.Version=$(VERSION)
 
-.PHONY: all build test race bench diff install clean release linux
+.PHONY: all build test race check bench diff install clean release linux
 
 all: build
 
 build:
 	go build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN) ./cmd/parallelizer
+
+# The commit checklist in one command.
+check:
+	test -z "$$(gofmt -l .)" || { gofmt -l .; exit 1; }
+	go vet ./...
+	go test -race ./...
+	$(MAKE) diff
 
 test:
 	go test ./...

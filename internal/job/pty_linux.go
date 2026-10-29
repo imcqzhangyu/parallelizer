@@ -17,21 +17,24 @@ func openPty() (*os.File, *os.File, error) {
 		return nil, nil, fmt.Errorf("open /dev/ptmx: %w", err)
 	}
 	var unlock int32 // 0 = unlock
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, m.Fd(),
-		uintptr(syscall.TIOCSPTLCK), uintptr(unsafe.Pointer(&unlock))); errno != 0 {
+	if err := ioctl(m, syscall.TIOCSPTLCK, unsafe.Pointer(&unlock)); err != nil {
 		m.Close()
-		return nil, nil, fmt.Errorf("unlock pty: %w", errno)
+		return nil, nil, fmt.Errorf("unlock pty: %w", err)
 	}
 	var n uint32
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, m.Fd(),
-		uintptr(syscall.TIOCGPTN), uintptr(unsafe.Pointer(&n))); errno != 0 {
+	if err := ioctl(m, syscall.TIOCGPTN, unsafe.Pointer(&n)); err != nil {
 		m.Close()
-		return nil, nil, fmt.Errorf("pty number: %w", errno)
+		return nil, nil, fmt.Errorf("pty number: %w", err)
 	}
 	s, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR|syscall.O_NOCTTY, 0)
 	if err != nil {
 		m.Close()
 		return nil, nil, fmt.Errorf("open pty slave: %w", err)
+	}
+	if err := makeBlocking(s); err != nil {
+		s.Close()
+		m.Close()
+		return nil, nil, fmt.Errorf("prepare pty slave: %w", err)
 	}
 	return m, s, nil
 }

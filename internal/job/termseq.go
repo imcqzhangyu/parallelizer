@@ -54,11 +54,18 @@ func SignalByName(name string) (syscall.Signal, error) {
 
 // KillGroup signals the whole process group and returns once it is gone or the
 // step's grace period expires.
+//
+// The group is checked for existence immediately before every signal: the
+// caller may have raced with the job being reaped (its pgid then becomes
+// eligible for reuse by an unrelated process).
 func KillGroup(pgid int, steps []SignalStep) {
 	if pgid <= 1 {
 		return
 	}
 	for _, st := range steps {
+		if syscall.Kill(-pgid, 0) != nil {
+			return // ESRCH: the whole group is gone
+		}
 		_ = syscall.Kill(-pgid, st.Signal)
 		if st.Wait <= 0 {
 			continue

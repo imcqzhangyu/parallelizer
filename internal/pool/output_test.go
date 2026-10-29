@@ -57,6 +57,40 @@ func TestKeepOrderHoldsUntilGapFills(t *testing.T) {
 	}
 }
 
+// FlushPending prints finished output that is stuck behind sequence numbers
+// which can never arrive: the run halted and abandoned queued or unstarted
+// jobs, so the --keep-order cursor would otherwise wait forever and never
+// print what did finish.
+func TestFlushPendingPrintsStuckOutput(t *testing.T) {
+	var out, errb bytes.Buffer
+	o := NewOutput(&out, &errb, false, true)
+
+	o.Emit(3, "", sinkWith(t, "three\n"), nil)
+	o.Emit(5, "", sinkWith(t, "five\n"), nil)
+	o.Skip(4) // a killed job between them
+	if out.Len() != 0 {
+		t.Fatalf("output appeared before FlushPending: %q", out.String())
+	}
+	o.FlushPending()
+	if got := out.String(); got != "three\nfive\n" {
+		t.Fatalf("stdout = %q, want the finished output in order", got)
+	}
+	if len(o.pending) != 0 {
+		t.Fatalf("%d pending entries leaked", len(o.pending))
+	}
+}
+
+// Without --keep-order there is nothing to flush.
+func TestFlushPendingNoopWithoutKeepOrder(t *testing.T) {
+	var out, errb bytes.Buffer
+	o := NewOutput(&out, &errb, false, false)
+	o.Emit(1, "", sinkWith(t, "one\n"), nil)
+	o.FlushPending()
+	if got := out.String(); got != "one\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
 func TestKeepOrderSkipIsIdempotent(t *testing.T) {
 	var out, errb bytes.Buffer
 	o := NewOutput(&out, &errb, false, true)

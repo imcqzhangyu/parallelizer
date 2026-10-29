@@ -135,6 +135,23 @@ check_stderr "stderr passthru" $'echo oops >&2\necho ok\n' -j1
 check "halted job output dropped" $'echo kept; sleep 3\nexit 1\n' -j2 --halt now,fail=1
 check "many jobs"       "$(for i in $(seq 1 200); do echo "echo $i"; done)" -j8
 check "halt many"       "$(for i in $(seq 1 50); do echo "true"; done)"$'\nexit 9\n' -j8 --halt now,fail=1
+# Percentage rules exit with the percentage of failed jobs (GNU: 1 of 4 = 25).
+check "halt 5% exit"     $'false\nfalse\nfalse\nfalse\n' -j4 --halt 5%
+# A percentage rule that never fires still exits with the failure percentage.
+check "halt 100% not fired" $'exit 1\ntrue\ntrue\ntrue\n' -j1 --halt 100%
+check "halt 30% exit"    "$(printf 'false\n%.0s' 1 2 3)"$'\n'"$(printf 'true\n%.0s' 4 5 6 7 8)" -j8 --halt 30%
+# --timeout accepts GNU's fractional bare seconds. The job must outlive GNU's
+# ~1s timeout-check granularity (sleep 1 would finish before GNU notices).
+check "timeout fractional" $'sleep 3\n' -j1 --timeout 0.2
+# -r is GNU's --no-run-if-empty (we never run empty input anyway).
+check "no-run-if-empty"  $'   \n' -r
+# GNU 20160222 drops --tag in --dry-run; newer GNU prefixes the command with
+# it. Probe, then compare against the convention the installed GNU uses.
+if printf 'echo hi\n' | $GNU -j1 --dry-run --tag 2>/dev/null | grep -q $'echo hi\techo hi'; then
+    check "dry-run tag"      $'echo hi\n' -j1 --dry-run --tag
+else
+    printf 'skip %-32s (this GNU drops --tag in --dry-run)\n' "dry-run tag"
+fi
 check_resume "resume skips done" $'echo one\necho two\necho three\n' -j2 -k --resume
 
 # Deliberate differences from GNU parallel, covered by go tests instead:

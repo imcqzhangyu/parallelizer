@@ -21,6 +21,10 @@ type Exec struct {
 	VerboseW io.Writer
 	// OnStart is called with the job's process group id as soon as it exists.
 	OnStart func(seq, pgid int)
+	// OnReap is called as soon as the job's process has been reaped, before
+	// any output is joined. It lets the scheduler drop the pgid so that a
+	// concurrent halt cannot signal a recycled process group.
+	OnReap func(seq int)
 
 	// Pty runs the job on its own pseudo-terminal (--pty): the job gets a
 	// controlling terminal (so TUIs can draw and read input), stdin is the
@@ -56,6 +60,12 @@ func (e *Exec) Run(spec Spec, stdout, stderr io.Writer) Result {
 	// terminal in a raw-mode state we never set. TUIs that really need a
 	// terminal are served by --pty instead.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// A job that leaves a daemon behind must not hold the run hostage: GNU
+	// parallel returns as soon as the job exits, but Go's exec keeps reading
+	// the stdout/stderr pipes until every writer (including orphaned
+	// grandchildren) closes them. Bound that wait after the process exits;
+	// output produced later by the daemon is dropped (see ErrWaitDelay).
+	cmd.WaitDelay = 500 * time.Millisecond
 
 	var master, slave *os.File
 	if e.Pty {
@@ -68,7 +78,7 @@ func (e *Exec) Run(spec Spec, stdout, stderr io.Writer) Result {
 		}
 		master, slave = m, s
 		if ws, ok := e.Tty.WindowSize(); ok && ws.Row > 0 && ws.Col > 0 {
-			setTerminalSize(slave.Fd(), ws) // best effort: TUIs need a sane size
+			setTerminalSize(slave, ws) // best effort: TUIs need a sane size
 		}
 		cmd.Stdin = slave // a terminal, not /dev/null
 		cmd.Stdout = slave
@@ -94,6 +104,14 @@ func (e *Exec) Run(spec Spec, stdout, stderr io.Writer) Result {
 		slave.Close() // the child holds its own references now
 	}
 
+	pgid := cmd.Process.Pid
+	if e.OnStart != nil {
+		// Register the pgid before Tty.Add: Add may block writing pending
+		// keystrokes into a pty the job is not reading, and a job that is not
+		// registered cannot be killed by --halt or Ctrl-C.
+		e.OnStart(spec.Seq, pgid)
+	}
+
 	// --pty: the child's merged stdout/stderr stream out of the pty into the
 	// job's normal output writer (sinks, tags, keep-order all downstream).
 	// Keystrokes flow the other way through the hub.
@@ -107,29 +125,32 @@ func (e *Exec) Run(spec Spec, stdout, stderr io.Writer) Result {
 		}()
 	}
 
-	pgid := cmd.Process.Pid
-	if e.OnStart != nil {
-		e.OnStart(spec.Seq, pgid)
-	}
-
 	var timedOut atomic.Bool
 	var timer *time.Timer
+	var timerDone chan struct{}
 	if e.Timeout > 0 {
+		timerDone = make(chan struct{})
 		timer = time.AfterFunc(e.Timeout, func() {
+			defer close(timerDone)
 			timedOut.Store(true)
 			KillGroup(pgid, e.TermSeq)
 		})
 	}
 
 	err := cmd.Wait()
-	if timer != nil {
-		timer.Stop()
+	if timer != nil && !timer.Stop() {
+		// The callback fired (or is about to): join it so it cannot signal the
+		// already reaped pgid after Run returns.
+		<-timerDone
+	}
+	if e.OnReap != nil {
+		e.OnReap(spec.Seq)
 	}
 	if master != nil {
 		e.Tty.Remove(master)
 		// Normally the master sees EOF/EIO as soon as the last slave fd is
 		// gone. A grandchild can keep it open: close ours after a grace
-		// period so the copy goroutine cannot outlive the job forever.
+		// period. The master is non-blocking, so Close also unblocks a read.
 		select {
 		case <-copyDone:
 		case <-time.After(500 * time.Millisecond):
@@ -158,7 +179,10 @@ func (r *Result) finish(cmd *exec.Cmd, err error) {
 		r.ExitCode = cmd.ProcessState.ExitCode()
 	}
 	var ee *exec.ExitError
-	if err != nil && !errors.As(err, &ee) {
+	if err != nil && !errors.As(err, &ee) && !errors.Is(err, exec.ErrWaitDelay) {
+		// ErrWaitDelay only means an orphaned child kept the output pipe open
+		// past cmd.WaitDelay; the job itself exited normally, so its exit code
+		// and accounting stand. Later output from that orphan is dropped.
 		r.Err = err
 		if r.ExitCode == 0 && r.Signal == 0 {
 			r.ExitCode = 127

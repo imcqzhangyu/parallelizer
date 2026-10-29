@@ -34,7 +34,6 @@ func (s *Sink) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	s.n += int64(len(p))
 
 	if s.file == nil && int64(s.buf.Len())+int64(len(p)) > s.limit {
 		// Spill to disk. Failing here is an error: quietly keeping the data in
@@ -57,11 +56,13 @@ func (s *Sink) Write(p []byte) (int, error) {
 		if _, err := s.file.Write(p); err != nil {
 			return s.fail(err)
 		}
+		s.n += int64(len(p))
 		return len(p), nil
 	}
 	if _, err := s.buf.Write(p); err != nil {
 		return s.fail(err)
 	}
+	s.n += int64(len(p))
 	return len(p), nil
 }
 

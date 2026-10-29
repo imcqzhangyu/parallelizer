@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"syscall"
 
@@ -73,6 +74,33 @@ func (o *Output) Skip(seq int) {
 	}
 	o.pending[seq] = nil
 	o.drainPendingLocked()
+}
+
+// FlushPending prints output that is still waiting for a lower sequence
+// number. It is only used when a run ends by halting: the missing sequences
+// will never arrive (their commands were never started, or the reader could
+// not be unblocked), and losing finished output would be worse than printing
+// it out of order.
+func (o *Output) FlushPending() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.keepOrder {
+		return
+	}
+	seqs := make([]int, 0, len(o.pending))
+	for seq := range o.pending {
+		seqs = append(seqs, seq)
+	}
+	sort.Ints(seqs)
+	for _, seq := range seqs {
+		if p := o.pending[seq]; p != nil {
+			o.writeLocked(p.tag, p.a, p.b)
+		}
+		delete(o.pending, seq)
+	}
+	if n := len(seqs); n > 0 {
+		o.next = seqs[n-1] + 1
+	}
 }
 
 // drainPendingLocked emits pending jobs in sequence order.
@@ -183,6 +211,11 @@ func (l *LineStream) drain(all bool) {
 
 // Flush emits any trailing partial line.
 func (l *LineStream) Flush() { l.drain(true) }
+
+// Discard drops the unflushed tail. It is used for a job killed by --halt
+// when --keep-killed-output is off: the complete lines already went out, but
+// the partial line is still ours to drop.
+func (l *LineStream) Discard() { l.buf = nil }
 
 func (o *Output) writeLine(w io.Writer, tag string, line []byte) {
 	o.mu.Lock()

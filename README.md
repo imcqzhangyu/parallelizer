@@ -25,8 +25,9 @@ make linux          # static linux/amd64 binary
 
 The binary is pure Go (`CGO_ENABLED=0`), so it runs on CentOS and any other
 Linux with a 3.x kernel — verified on **CentOS 7.9 (glibc 2.17, kernel 3.10)**
-against GNU parallel 20160222 (22/22 comparable scenarios; 2 skipped because
-that GNU lacks `--halt ...done` and misreports signal-killed jobs).
+against GNU parallel 20160222 (27/27 comparable scenarios; 3 skipped for
+old-GNU limitations: no `--halt ...done`, signal-killed jobs exit 0, and
+`--tag` is dropped in `--dry-run`).
 
 ## Usage
 
@@ -42,8 +43,9 @@ parallelizer [flags] -a FILE      commands from FILE
 | `-a, --arg-file FILE` | read commands from FILE (`-` = stdin) |
 | `--joblog FILE` | 9-column TSV log, GNU compatible (`-` = stdout, `+FILE` = append) |
 | `--resume` | skip jobs already listed in `--joblog` (requires a file, not `-`) |
-| `-r, --retries N` | re-run each failed job up to N more times (same host) |
-| `--timeout DUR` | kill a job after DUR (`30s`, `5m`, `200ms`, or bare seconds like `30`) |
+| `--retries N` | re-run each failed job up to N more times (same host) |
+| `-r, --no-run-if-empty` | accepted for GNU compatibility (empty input never runs) |
+| `--timeout DUR` | kill a job after DUR (`30`, `0.5`, `30s`, `5m`, `1h`, `1d`; Go units like `200ms` also work) |
 | `--termseq SEQ` | kill escalation (default `TERM,200,TERM,100,TERM,50,KILL,25`) |
 | `--tmpdir DIR` | where large outputs are spooled |
 | `--mem-limit BYTES` | in-memory output per stream before spilling (default 8 MiB) |
@@ -86,7 +88,7 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 | Code | Meaning |
 |---|---|
 | `0` | everything succeeded |
-| `1`-`100` | number of failed jobs (`101` means more than 100) |
+| `1`-`100` | number of failed jobs (`101` means more than 100); with a percentage `--halt` rule this is the percentage of failed jobs, rounded up, whether or not the rule fired |
 | job's status | with `--halt ...fail=1` (e.g. `3`) |
 | `128+S` | with `--halt ...fail=1` when the job died from signal `S` |
 | `130` / `143` | interrupted by SIGINT / SIGTERM |
@@ -96,8 +98,19 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 ## Behaviour notes
 
 - A job's stdin is `/dev/null`.
-- Empty and whitespace-only lines are skipped.
+- Empty and whitespace-only lines are skipped (GNU parallel runs them as
+  no-op jobs, which also shifts its sequence numbers — see the differences
+  table).
 - A trailing line without a newline is still executed.
+- A job is finished when its shell exits. If the job leaves a daemon behind,
+  the run does not wait for that daemon to close the inherited output: the
+  wait is bounded (500ms) and later output from the daemon is dropped, the
+  same way GNU parallel returns at the shell exit.
+- `-r`/`--no-run-if-empty` is accepted for GNU compatibility and has no
+  effect: empty input never runs anything. Retries are `--retries N`.
+- Interrupting with `SIGINT`/`SIGTERM` (or `--halt`) stops the run even when
+  the command list comes from a stream that stays open (`tail -f cmds | ...`):
+  the reader is abandoned instead of being waited for.
 - Output is grouped per job by default (the failing job's block is printed, then
   the next job's), which is what makes parallel output look like sequential
   output. Killed jobs' output is discarded unless `--keep-killed-output` is set;
@@ -108,7 +121,9 @@ so children and grandchildren die too. `soon` only stops handing out new work.
   roughly `2 x -j x --mem-limit`). If the spool file cannot be created (bad
   `--tmpdir`, full disk) the job fails loudly instead of growing in memory.
 - `--line-buffer` keeps stdout and stderr separate and flushes a partial line
-  once it exceeds `--mem-limit`, so one huge line cannot exhaust memory.
+  once it exceeds `--mem-limit`, so one huge line cannot exhaust memory. A job
+  killed by `--halt` loses its unflushed tail unless `--keep-killed-output` is
+  set (complete lines have already been streamed and cannot be recalled).
 - `--joblog +FILE` appends to an existing log without repeating the header (the
   GNU syntax). A plain `--joblog FILE` overwrites, as GNU does. A job killed by
   signal `S` is logged as `Exitval = 128+S`, `Signal = S`.
@@ -160,7 +175,8 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 | `--tag` | command/argument prefix | command prefix (same for this mode) |
 | `--tag` with `-u` | tag is dropped | tag is kept, writes are serialised per line |
 | Trailing `\r` | kept | stripped (use `--keep-cr` to keep) |
-| `-j 0` | unlimited | rejected |
+| Empty/whitespace-only lines | run as no-op jobs (joblog rows, exit 0) | skipped, so sequence numbers and percentage `--halt` totals differ |
+| `-j 0` / `-j 0%` | unlimited | rejected |
 | Interrupt exit | `255` | `130` / `143` / `141` (SIGINT/SIGTERM/SIGPIPE) |
 | Killed job output | discarded | discarded (opt-in with `--keep-killed-output`) |
 | Job reading `/dev/tty` (TUI) | hangs (SIGTTIN stop) | fails fast (own session, no controlling terminal) |
@@ -174,7 +190,8 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 | `--halt ...done=N` | needs a newer GNU (missing in 20160222) | always supported |
 | `--halt ...fail=1` exit for a signal-killed job | 20160222 exits 0 (despite reporting the failure); newer GNU exits 128+S | 128+S (matches newer GNU) |
 | joblog `Exitval` for signal death | 20160222 logs 0 (`Signal` carries S); newer GNU logs 128+S | 128+S (matches newer GNU) |
-| Percentage `--halt` exit | number of failed jobs | same |
+| `--timeout 100ms` | rejected (GNU units are s/m/h/d) | accepted (Go duration units too) |
+| Percentage `--halt` exit | percentage of failed jobs, rounded up (25 for 1 of 4) | same |
 
 ## Performance
 
@@ -192,13 +209,14 @@ micro-benchmarks for the output hot paths.
 make test    # unit + end-to-end
 make race    # go test -race
 make diff    # differential test against GNU parallel
+make check   # gofmt + vet + race + diff (the commit checklist in one command)
 ```
 
 `make diff` compares exit status and sorted output (and stderr for one case)
-against GNU parallel for 24 scenarios. Scenarios whose semantics are missing or
+against GNU parallel for 30 scenarios. Scenarios whose semantics are missing or
 wrong in old GNU builds are **capability-gated** (probe GNU, print `skip`), so
-the same script passes on GNU 20160222 (22 ok, 2 skipped) and modern GNU
-(24 ok). Point it at a specific GNU binary with:
+the same script passes on GNU 20160222 (27 ok, 3 skipped) and modern GNU
+(30 ok). Point it at a specific GNU binary with:
 
 ```bash
 GNU_PARALLEL="perl /path/to/gnu-parallel/src/parallel" make diff
@@ -209,17 +227,18 @@ codes 130/143, SIGPIPE 141, spool cleanup, joblog signal columns, flag
 rejections); it needs only bash and the binary:
 
 ```bash
-PLZ=./parallelizer-linux-amd64 ./test/remote_smoke.sh   # 23 assertions
+PLZ=./parallelizer-linux-amd64 ./test/remote_smoke.sh   # 29 assertions
 ```
 
 GitHub Actions runs `gofmt`, `go vet`, `go test -race`, the fuzz seed corpus
 and the GNU differential test on every push (`.github/workflows/ci.yml`).
 
-Three behaviours differ from GNU parallel on purpose and are covered by the go
-tests instead: `--tag` is kept with `-u` (GNU drops it), `--keep-killed-output`
-is an extension (the reference GNU build has no such flag), and `-k` still
-prints output that follows a job killed by `--halt` (GNU loses it behind the
-hole).
+Several behaviours differ from GNU parallel on purpose and are covered by the
+Go tests instead: `--tag` is kept with `-u` (GNU drops it),
+`--keep-killed-output` is an extension, `-k` still prints output that follows
+a job killed by `--halt` (GNU loses it behind the hole), empty lines are
+skipped, and TUIs get session isolation plus the `--pty` extension. The table
+above lists every divergence.
 
 ## Layout
 

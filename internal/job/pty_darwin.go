@@ -20,24 +20,21 @@ func openPty() (*os.File, *os.File, error) {
 		return nil, nil, fmt.Errorf("open /dev/ptmx: %w", err)
 	}
 	var buf [128]byte
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, m.Fd(),
-		uintptr(syscall.TIOCPTYGNAME), uintptr(unsafe.Pointer(&buf[0]))); errno != 0 {
+	if err := ioctl(m, syscall.TIOCPTYGNAME, unsafe.Pointer(&buf[0])); err != nil {
 		m.Close()
-		return nil, nil, fmt.Errorf("pty name: %w", errno)
+		return nil, nil, fmt.Errorf("pty name: %w", err)
 	}
 	name := string(bytes.TrimRight(buf[:], "\x00"))
-	// Apple's grantpt()/unlockpt() in one shot: TIOCPTYGRANT hands the fresh
-	// slave (root:tty 0620) to the opener, TIOCPTYUNLK drops the lock the
-	// kernel puts on a freshly created pair (open then returns EAGAIN).
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, m.Fd(),
-		uintptr(syscall.TIOCPTYGRANT), 0); errno != 0 {
+	// Apple's grantpt()/unlockpt(): TIOCPTYGRANT hands the fresh slave
+	// (root:tty 0620) to the opener, TIOCPTYUNLK drops the lock the kernel
+	// puts on a freshly created pair (open then returns EAGAIN).
+	if err := ioctl(m, syscall.TIOCPTYGRANT, nil); err != nil {
 		m.Close()
-		return nil, nil, fmt.Errorf("grant pty: %w", errno)
+		return nil, nil, fmt.Errorf("grant pty: %w", err)
 	}
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, m.Fd(),
-		uintptr(syscall.TIOCPTYUNLK), 0); errno != 0 {
+	if err := ioctl(m, syscall.TIOCPTYUNLK, nil); err != nil {
 		m.Close()
-		return nil, nil, fmt.Errorf("unlock pty: %w", errno)
+		return nil, nil, fmt.Errorf("unlock pty: %w", err)
 	}
 	path := name
 	if !strings.HasPrefix(path, "/") {
@@ -47,6 +44,11 @@ func openPty() (*os.File, *os.File, error) {
 	if err != nil {
 		m.Close()
 		return nil, nil, fmt.Errorf("open pty slave %s: %w", path, err)
+	}
+	if err := makeBlocking(s); err != nil {
+		s.Close()
+		m.Close()
+		return nil, nil, fmt.Errorf("prepare pty slave: %w", err)
 	}
 	return m, s, nil
 }
