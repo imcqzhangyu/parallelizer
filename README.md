@@ -136,6 +136,7 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 | Interrupt exit | `255` | `130` / `143` / `141` (SIGINT/SIGTERM/SIGPIPE) |
 | Killed job output | discarded | discarded (opt-in with `--keep-killed-output`) |
 | `-k` + killed job | later output is lost behind the hole | later output is still printed |
+| `-k` + `--line-buffer` | allowed (degrades to grouped output) | rejected as mutually exclusive |
 | `--joblog` append | `--joblog +FILE` | same (`+FILE`) |
 | `--resume` | skips jobs listed in `--joblog` | same (output of skipped jobs is not replayed) |
 | `--retries N` | only with `--sshlogin` (other hosts) | retried on the same host |
