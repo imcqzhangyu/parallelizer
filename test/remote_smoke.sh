@@ -107,6 +107,23 @@ check "--resume without --joblog rejected" "255" "$(printf 'true\n' | "$PLZ" --r
 check "-a missing file rejected" "255" "$("$PLZ" -a "$WORK/missing" >/dev/null 2>&1; echo $?)"
 check "bare --timeout seconds accepted" "1" "$(printf 'sleep 5\n' | "$PLZ" -j1 --timeout 1 >/dev/null 2>&1; echo $?)"
 
+# --- pty / terminal isolation -------------------------------------------
+# Default path: jobs have no controlling terminal and must fail fast.
+out=$(printf '(exec 3<>/dev/tty 2>/dev/null) && echo CTTY-OPEN-OK || echo CTTY-OPEN-FAIL\n' | "$PLZ" -j1 2>/dev/null | tr -d '\r')
+check "default job cannot open /dev/tty" "CTTY-OPEN-FAIL" "$out"
+
+# --pty: the job gets its own controlling terminal even with no tty around.
+out=$(printf 'test -t 0 && echo TTY0; (exec 3<>/dev/tty 2>/dev/null) && echo CTTY-OK || echo CTTY-NO; echo pty-done\n' | "$PLZ" -j1 --pty 2>/dev/null | tr -d '\r')
+if printf '%s' "$out" | grep -q '^TTY0$' && printf '%s' "$out" | grep -q '^CTTY-OK$' && printf '%s' "$out" | grep -q '^pty-done$'; then
+    ok "--pty job gets a controlling terminal"
+else
+    bad "--pty job gets a controlling terminal" "out=$(printf '%s' "$out" | tr '\n' '|')"
+fi
+
+# --pty output still flows through the buffering pipeline under -k.
+out=$(printf 'echo buffered\n' | "$PLZ" -j1 --pty -k 2>/dev/null | tr -d '\r')
+check "--pty output through keep-order" "buffered" "$out"
+
 echo
 echo "passed: $pass, failed: $fail"
 [ "$fail" -eq 0 ]

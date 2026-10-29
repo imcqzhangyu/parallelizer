@@ -20,6 +20,7 @@ type Pool struct {
 	out    *Output
 	log    *log.TSV
 	exec   *job.Exec
+	tty    *job.TtyHub  // --pty keystroke forwarding; nil otherwise
 	skip   map[int]bool // --resume: jobs already in the joblog
 	stdout io.Writer
 	stderr io.Writer
@@ -75,6 +76,10 @@ func New(opts *cli.Options, total int, stdout, stderr io.Writer) (*Pool, error) 
 		stdout: stdout,
 		stderr: stderr,
 	}
+	var tty *job.TtyHub
+	if opts.Pty {
+		tty = job.NewTtyHub() // probes our terminal; never fails
+	}
 	p.exec = &job.Exec{
 		Shell:    opts.Shell,
 		Timeout:  opts.Timeout,
@@ -83,7 +88,10 @@ func New(opts *cli.Options, total int, stdout, stderr io.Writer) (*Pool, error) 
 		Verbose:  opts.Verbose,
 		VerboseW: stderr,
 		OnStart:  p.st.SetPgid,
+		Pty:      opts.Pty,
+		Tty:      tty,
 	}
+	p.tty = tty
 	p.out.onEPIPE = func() { p.st.Interrupt(141) }
 	return p, nil
 }
@@ -259,6 +267,9 @@ func firstSinkErr(sinks ...*sink.Sink) error {
 }
 
 func (p *Pool) Close() error {
+	if p.tty != nil {
+		p.tty.Close()
+	}
 	if p.log != nil {
 		return p.log.Close()
 	}

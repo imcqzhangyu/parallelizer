@@ -57,6 +57,7 @@ parallelizer [flags] -a FILE      commands from FILE
 | `-q, --quiet` | do not report failing jobs |
 | `--keep-cr` | keep the `\r` of CRLF input |
 | `--keep-killed-output` | keep output from jobs killed by `--halt` |
+| `--pty` | run each job on its own pseudo-terminal (TUIs: merged streams, live keystroke forwarding) |
 
 ### Environment
 
@@ -131,6 +132,18 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 - A `-j` far above the file-descriptor soft limit prints a startup warning:
   each running job holds two pipe ends.
 - `SIGUSR1` prints the jobs that are currently running.
+- Every job runs in its **own session without a controlling terminal**:
+  opening `/dev/tty` fails immediately (the job reports an error and ends)
+  instead of hanging forever on a SIGTTIN stop or putting the real terminal
+  into a raw-mode state nobody restores.
+- `--pty` gives a job its own pseudo-terminal instead: TUIs can draw and read
+  input, `stdin` is the terminal (not `/dev/null`), `stdout` and `stderr` are
+  **merged into one stream**, output streams live like `-u` (unless `-k` or
+  `--line-buffer` is set), and keystrokes from `/dev/tty` (or from stdin when
+  it is a terminal) are forwarded to **every** running pty job — use `-j1` for
+  interactive jobs. The window size is copied into the pty when the job
+  starts. With no terminal at all (cron/CI) nothing is forwarded; interactive
+  jobs then need `--timeout`.
 - A job's command line may be arbitrarily long, but it is held in memory: very
   long lines cost RAM proportional to their length.
 - `-j 0` is rejected on purpose: unlimited concurrency is a good way to take a
@@ -150,6 +163,8 @@ so children and grandchildren die too. `soon` only stops handing out new work.
 | `-j 0` | unlimited | rejected |
 | Interrupt exit | `255` | `130` / `143` / `141` (SIGINT/SIGTERM/SIGPIPE) |
 | Killed job output | discarded | discarded (opt-in with `--keep-killed-output`) |
+| Job reading `/dev/tty` (TUI) | hangs (SIGTTIN stop) | fails fast (own session, no controlling terminal) |
+| `--pty` | not available | per-job pty: merged streams, keystroke forwarding, live output |
 | `-k` + killed job | later output is lost behind the hole | later output is still printed |
 | `-k` + `--line-buffer` | allowed (degrades to grouped output) | rejected as mutually exclusive |
 | `--joblog` append | `--joblog +FILE` | same (`+FILE`) |
@@ -212,7 +227,8 @@ hole).
 cmd/parallelizer       entry point, signals, input setup
 internal/cli           flag parsing, --halt and --termseq
 internal/source        streaming line reader, spooling
-internal/job           process-group execution, timeout, result
+internal/job           session-isolated execution, timeout, termseq, pty pair
+                       and keystroke hub for --pty
 internal/pool          worker pool, halt state machine, output ordering
 internal/sink          per-job output buffer with disk spill
 internal/log           GNU-compatible TSV job log

@@ -265,3 +265,89 @@ func TestResultStatusAndFailed(t *testing.T) {
 		}
 	}
 }
+
+// A job normally sits in its own session with no controlling terminal: opening
+// /dev/tty must fail fast (this is the SIGTTIN-freeze hardening) instead of
+// waiting for input that will never come.
+func TestDefaultJobHasNoControllingTerminal(t *testing.T) {
+	var out, errb bytes.Buffer
+	cmd := `(exec 3<>/dev/tty 2>/dev/null) && echo CTTY-OPEN-OK || echo CTTY-OPEN-FAIL; test -t 0 && echo TTY0 || echo NO-TTY0`
+	res := testExec().Run(Spec{Seq: 1, Command: cmd}, &out, &errb)
+	if res.Failed() {
+		t.Fatalf("job failed: %+v, stderr=%s", res, errb.String())
+	}
+	if strings.Contains(out.String(), "CTTY-OPEN-OK") {
+		t.Fatalf("job opened /dev/tty — session isolation broken: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "CTTY-OPEN-FAIL") || !strings.Contains(out.String(), "NO-TTY0") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+}
+
+// --pty: the job gets a controlling terminal (its own pty), stdin/stdout are
+// terminals, stderr is merged into the stdout writer, and /dev/tty opens.
+func TestPtyGivesJobAControllingTerminal(t *testing.T) {
+	var out, errb bytes.Buffer
+	e := testExec()
+	e.Pty = true
+	e.Tty = NewTtyHub()
+	defer e.Tty.Close()
+
+	cmd := `(exec 3<>/dev/tty 2>/dev/null) && echo CTTY-OPEN-OK || echo CTTY-OPEN-FAIL; test -t 0 && echo TTY0 || echo NO-TTY0; test -t 1 && echo TTY1 || echo NO-TTY1; echo ERRLINE >&2`
+	res := e.Run(Spec{Seq: 1, Command: cmd}, &out, &errb)
+	if res.Failed() {
+		t.Fatalf("job failed: %+v, stderr=%s", res, errb.String())
+	}
+	for _, want := range []string{"CTTY-OPEN-OK", "TTY0", "TTY1", "ERRLINE"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("stdout missing %q: %q", want, out.String())
+		}
+	}
+	if errb.Len() != 0 {
+		t.Errorf("--pty must merge stderr into the job stream, got separate stderr %q", errb.String())
+	}
+}
+
+// --pty output flows through the normal pipe: the copy from the pty master
+// must not outlive the job (bounded join) nor lose trailing data.
+func TestPtyCopyCompletesBeforeReturn(t *testing.T) {
+	var out, errb bytes.Buffer
+	e := testExec()
+	e.Pty = true
+	e.Tty = NewTtyHub()
+	defer e.Tty.Close()
+
+	res := e.Run(Spec{Seq: 1, Command: "printf 'a\\nb\\nc'"}, &out, &errb)
+	if res.Failed() {
+		t.Fatalf("job failed: %+v", res)
+	}
+	// The pty line discipline converts \n to \r\n (ONLCR) — inherent to pty.
+	got := strings.ReplaceAll(out.String(), "\r\n", "\n")
+	if got != "abc" && got != "a\nb\nc" {
+		t.Fatalf("stdout = %q, want the pty output complete before Run returns", out.String())
+	}
+}
+
+// A pty job that waits for input never receives any on its own (no hub
+// source); --timeout must still reap it — the pty must not hide the job from
+// the kill logic.
+func TestPtyTimeoutKillsWaitingJob(t *testing.T) {
+	var out, errb bytes.Buffer
+	e := testExec()
+	e.Pty = true
+	e.Tty = NewTtyHub()
+	defer e.Tty.Close()
+	e.Timeout = 300 * time.Millisecond
+
+	start := time.Now()
+	res := e.Run(Spec{Seq: 1, Command: "read x < /dev/tty; echo SURVIVED"}, &out, &errb)
+	if dur := time.Since(start); dur > 3*time.Second {
+		t.Fatalf("job was not reaped, took %v", dur)
+	}
+	if !res.Failed() {
+		t.Fatalf("waiting pty job must fail on timeout: %+v", res)
+	}
+	if strings.Contains(out.String(), "SURVIVED") {
+		t.Fatalf("job survived the timeout: %q", out.String())
+	}
+}

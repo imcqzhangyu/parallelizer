@@ -204,6 +204,34 @@ func TestTimeoutBareSeconds(t *testing.T) {
 	}
 }
 
+// --pty implies streaming (-u) so interactive output is visible while the job
+// runs; explicit buffering modes (-k, --line-buffer) are respected instead.
+func TestPtyImpliesUngroup(t *testing.T) {
+	opts, err := Parse([]string{"--pty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.Ungroup {
+		t.Error("--pty must imply --ungroup for interactive output")
+	}
+
+	opts, err = Parse([]string{"--pty", "-k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Ungroup || !opts.KeepOrder {
+		t.Errorf("-k must win over --pty's implied streaming: %+v", opts)
+	}
+
+	opts, err = Parse([]string{"--pty", "--line-buffer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Ungroup || !opts.LineBuffer {
+		t.Errorf("--line-buffer must win over --pty's implied streaming: %+v", opts)
+	}
+}
+
 func TestParseTermSeq(t *testing.T) {
 	steps, err := ParseTermSeq("TERM,200,KILL,25")
 	if err != nil || len(steps) != 2 {

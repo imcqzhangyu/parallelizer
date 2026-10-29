@@ -43,6 +43,7 @@ type Options struct {
 	KeepKilled bool
 	Resume     bool
 	Retries    int
+	Pty        bool
 
 	ShowVersion bool
 	ShowHelp    bool
@@ -76,6 +77,7 @@ func Parse(argv []string) (*Options, error) {
 		keepKilled bool
 		resume     bool
 		retries    int
+		pty        bool
 		verbose    int
 		showVer    bool
 		showHelp   bool
@@ -94,6 +96,7 @@ func Parse(argv []string) (*Options, error) {
 	fs.IntVar(&retries, "r", 0, "")
 	fs.IntVar(&retries, "retries", 0, "")
 	fs.BoolVar(&resume, "resume", false, "")
+	fs.BoolVar(&pty, "pty", false, "")
 	fs.DurationVar(&timeout, "timeout", 0, "")
 	fs.StringVar(&termSeqRaw, "termseq", "", "")
 	fs.StringVar(&tmpDir, "tmpdir", "", "")
@@ -150,6 +153,12 @@ func Parse(argv []string) (*Options, error) {
 		return nil, err
 	}
 
+	if pty && !keepOrder && !lineBuffer {
+		// A pty job is interactive by nature: buffered output would hide the
+		// prompt until the job exits, which defeats --pty. Stream like -u
+		// unless the user explicitly chose a buffering mode (-k, --line-buffer).
+		ungroup = true
+	}
 	opts := &Options{
 		JobCount:   jobs,
 		Halt:       rule,
@@ -171,6 +180,7 @@ func Parse(argv []string) (*Options, error) {
 		KeepKilled: keepKilled,
 		Resume:     resume,
 		Retries:    retries,
+		Pty:        pty,
 	}
 	if opts.MemLimit < 0 {
 		return nil, fmt.Errorf("--mem-limit must not be negative")
@@ -336,6 +346,10 @@ Flags:
   -u, --ungroup         let jobs write directly to the terminal (interleaved)
       --line-buffer     stream complete lines as they are produced
   -k, --keep-order      emit output in input order
+      --pty             run each job on its own pseudo-terminal (TUIs work;
+                        stdout+stderr are merged, keystrokes are forwarded,
+                        output streams like -u unless -k/--line-buffer is set —
+                        use -j1 for interactive jobs)
       --tag             prefix every output line with the job's command + TAB
       --dry-run         print commands instead of running them
   -v, --verbose         echo each command to stderr before running

@@ -18,7 +18,12 @@ gofmt -l .                 # must print nothing; CI fails otherwise
 - Single test: `go test -run TestName ./test/` (e2e package; it builds the
   binary itself in TestMain — no pre-build needed).
 - Remote-platform check: `PLZ=./parallelizer-linux-amd64 ./test/remote_smoke.sh`
-  (23 assertions, bash-only, runs on the CentOS box — see SERVER.local.md).
+  (26 assertions, bash-only, runs on the CentOS box — see SERVER.local.md).
+- TUI/pty harness: `python3 test/pty_manual.py ./bin/parallelizer` (needs a
+  python REPL subject; gives the tool a real controlling terminal and checks
+  keystroke forwarding + termios isolation). The e2e
+  `TestPtyForwardsKeystrokes` runs only when the test process has **no** ctty
+  (otherwise its key source would be /dev/tty, not the stdin it drives).
 - Fuzz seeds only: `go test -run 'Fuzz' ./internal/cli/`.
   Real fuzzing: `go test -fuzz FuzzParseHalt -fuzztime 20s ./internal/cli/`.
   **Never delete `internal/cli/testdata/fuzz/`** — entries there are fuzz-found
@@ -70,6 +75,17 @@ internal/log               GNU-compatible 9-column TSV joblog
   SIGTERM with default disposition (keeps 130/143).
 - **dry-run must not touch the joblog at all** (GNU does not even open it —
   verified in GNU's source, `if($opt::dryrun)` branch).
+- **Jobs run with `Setsid` (own session, no controlling terminal)** — never
+  revert to inheriting the caller's terminal: a TUI job would SIGTTIN-stop
+  forever and could leave the user's terminal in raw mode. `KillGroup` relies
+  on a session leader's pgid being its pid, so `kill(-pgid)` keeps working.
+- **`--pty` contracts**: implies `-u` streaming unless `-k`/`--line-buffer`
+  was set explicitly (buffered output would hide the REPL prompt); child uses
+  `Setsid+Setctty` with `Ctty: 0` (child fd index of the slave); stderr is
+  merged into the stdout writer; the keystroke hub reads `/dev/tty` first,
+  falls back to stdin-if-tty, and forwards to all live jobs (pending keys are
+  queued up to 64KB between jobs). Darwin's openPty needs the full
+  TIOCPTYGNAME → TIOCPTYGRANT → TIOCPTYUNLK sequence (see pty_darwin.go).
 
 ## GNU parallel is the spec
 

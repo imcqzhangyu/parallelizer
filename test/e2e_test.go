@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"parallelizer/internal/job"
 )
 
 var binPath string
@@ -621,6 +623,107 @@ func TestVerboseTwice(t *testing.T) {
 	}
 	if !strings.Contains(r.stderr, "exit=0") {
 		t.Fatalf("stderr = %q, want a completion line", r.stderr)
+	}
+}
+
+// findPython returns an interactive Python interpreter or skips the test.
+func findPython(t *testing.T) string {
+	t.Helper()
+	for _, cand := range []string{"python3", "python"} {
+		if err := exec.Command(cand, "-c", "pass").Run(); err == nil {
+			return cand
+		}
+	}
+	t.Skip("no python interpreter for the REPL test")
+	return ""
+}
+
+// --pty end to end: keys typed by the user reach an interactive REPL running
+// in a job, and its output comes back through the normal output pipeline.
+//
+// The tool's stdin is a pty here (commands come from -a), which exercises the
+// stdin-fallback key source. When this test process itself has a controlling
+// terminal the tool would use /dev/tty instead (the primary path, covered by
+// the manual harness), so skip rather than test the wrong source.
+func TestPtyForwardsKeystrokes(t *testing.T) {
+	if f, err := os.OpenFile("/dev/tty", os.O_RDWR, 0); err == nil {
+		f.Close()
+		t.Skip("test process has a controlling terminal; key source would be /dev/tty")
+	}
+	py := findPython(t)
+
+	dir := t.TempDir()
+	cmds := filepath.Join(dir, "cmds")
+	if err := os.WriteFile(cmds, []byte(py+" -q\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	master, slave, err := job.OpenPty()
+	if err != nil {
+		t.Fatalf("OpenPty: %v", err)
+	}
+	defer master.Close()
+
+	cmd := exec.Command(binPath, "-a", cmds, "-j1", "--pty")
+	cmd.Stdin = slave // a terminal: the hub's key source
+	var errb strings.Builder
+	cmd.Stderr = &errb
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	slave.Close() // the tool holds its own reference
+
+	// Collect the REPL prompt, then type into it.
+	var seen strings.Builder
+	prompt := make(chan struct{}, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := stdout.Read(buf)
+			if n > 0 {
+				seen.Write(buf[:n])
+				if strings.Contains(seen.String(), ">>>") {
+					select {
+					case prompt <- struct{}{}:
+					default:
+					}
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-prompt:
+	case <-time.After(20 * time.Second):
+		cmd.Process.Kill()
+		t.Fatalf("no REPL prompt; output so far %q, stderr %q", seen.String(), errb.String())
+	}
+	if _, err := master.Write([]byte("print(40 + 2)\nexit()\n")); err != nil {
+		t.Fatalf("typing into the REPL failed: %v", err)
+	}
+
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	select {
+	case err := <-wait:
+		if err != nil {
+			t.Fatalf("tool exit: %v (stderr=%s)", err, errb.String())
+		}
+	case <-time.After(30 * time.Second):
+		cmd.Process.Kill()
+		t.Fatalf("tool did not finish; output %q", seen.String())
+	}
+
+	if !strings.Contains(seen.String(), "42") {
+		t.Fatalf("REPL never evaluated the typed expression; output=%q stderr=%q",
+			seen.String(), errb.String())
 	}
 }
 
